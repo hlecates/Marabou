@@ -52,6 +52,7 @@ public:
     size_t find( const String &substring ) const;
     String substring( unsigned fromIndex, unsigned howMany ) const;
     bool endsWith( const String &suffix );
+    bool startsWith( const String &prefix ) const;
     void replace( const String &toReplace, const String &replaceWith );
     String trim() const;
     String trimZerosFromRight() const;

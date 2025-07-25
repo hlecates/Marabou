@@ -36,6 +36,9 @@
 #include <iostream>
 #include <math.h>
 
+#include "OnnxToTorch.h"
+#include "Debug.h"
+
 /******************
  * Public methods *
  ******************/
@@ -59,6 +62,22 @@ void OnnxParser::parse( InputQueryBuilder &query,
 {
     OnnxParser parser = OnnxParser( query, path, initialNodeNames, terminalNodeNames );
     parser.processGraph();
+    
+}
+
+
+// CHANGES
+std::shared_ptr<TorchModel> OnnxParser::parseAndReturnTorchModel(
+    InputQueryBuilder &query,
+    const String &path,
+    const Set<String> initialNodeNames,
+    const Set<String> terminalNodeNames)
+{
+    OnnxParser parser(query, path, initialNodeNames, terminalNodeNames);
+    parser.processGraph();
+    
+    auto torchModel = OnnxToTorchParser::parse(path, parser.getVarMap());
+    return torchModel;
 }
 
 
@@ -658,14 +677,14 @@ const Set<String> OnnxParser::readInputNames()
     Set<String> initializerNames;
     for ( auto &initNode : _network.initializer() )
     {
-        ONNX_LOG( Stringf( "Found initialiser '%s'", initNode.name().c_str() ).ascii() );
+        //ONNX_LOG( Stringf( "Found initialiser '%s'", initNode.name().c_str() ).ascii() );
         initializerNames.insert( initNode.name() );
     }
 
     Set<String> inputNames;
     for ( auto &inputNode : _network.input() )
     {
-        ONNX_LOG( Stringf( "Found input '%s'", inputNode.name().c_str() ).ascii() );
+        //ONNX_LOG( Stringf( "Found input '%s'", inputNode.name().c_str() ).ascii() );
         inputNames.insert( inputNode.name() );
     }
 
@@ -677,7 +696,7 @@ const Set<String> OnnxParser::readOutputNames()
     Set<String> outputNames;
     for ( auto &outputNode : _network.output() )
     {
-        ONNX_LOG( Stringf( "Found output '%s'", outputNode.name().c_str() ).ascii() );
+        //ONNX_LOG( Stringf( "Found output '%s'", outputNode.name().c_str() ).ascii() );
         outputNames.insert( outputNode.name() );
     }
     return outputNames;
@@ -874,8 +893,8 @@ Set<String> OnnxParser::getInputsToNode( onnx::NodeProto &node )
 void OnnxParser::makeMarabouEquations( onnx::NodeProto &node, bool makeEquations )
 {
     auto nodeType = node.op_type().c_str();
-    ONNX_LOG(
-        Stringf( "Processing node '%s' of type '%s'", node.name().c_str(), nodeType ).ascii() );
+    //ONNX_LOG(
+        //Stringf( "Processing node '%s' of type '%s'", node.name().c_str(), nodeType ).ascii() );
 
     if ( strcmp( nodeType, "Constant" ) == 0 )
     {

@@ -25,7 +25,11 @@
 #include "Vector.h"
 #include "onnx.proto3.pb.h"
 
-#define ONNX_LOG( x, ... ) LOG( GlobalConfiguration::ONNX_PARSER_LOGGING, "OnnxParser: %s\n", x )
+// Forward declaration
+class TorchModel;
+
+
+#define ONNX_LOG( x, ... ) MARABOU_LOG( GlobalConfiguration::ONNX_PARSER_LOGGING, "OnnxParser: %s\n", x )
 
 
 class OnnxParser
@@ -36,7 +40,14 @@ public:
                        const Set<String> inputNames,
                        const Set<String> outputNames );
 
+    // CHANGES  
+    std::shared_ptr<TorchModel> parseAndReturnTorchModel(
+                        InputQueryBuilder &query,
+                        const String &path,
+                        const Set<String> inputNames,
+                        const Set<String> outputNames);
 
+                      
 private:
     // Settings //
     OnnxParser( InputQueryBuilder &query,
@@ -65,6 +76,9 @@ private:
     unsigned _numberOfFoundInputs;
 
     // Methods //
+
+    // Getter for _varMap
+    const Map<String, Vector<Variable>>& getVarMap() const { return _varMap; }
 
     const Set<String> readInputNames();
     const Set<String> readOutputNames();

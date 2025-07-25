@@ -112,9 +112,20 @@ void Marabou::prepareQuery()
 
         if ( ( (String)networkFilePath ).endsWith( ".onnx" ) )
         {
+            /*
+            if options --> get TorchModel
+                InputQueryBuilder queryBuilder;
+                _torchMode = OnnxParser::parseAndReturnTorchModel(queryBuilder, networkFilePath, {}, {})
+                queryBuilder.generateQuery( _inputQuery );
+            else
+                InputQueryBuilder queryBuilder;
+                OnnxParser::parse( queryBuilder, networkFilePath, {}, {} );
+                queryBuilder.generateQuery( _inputQuery );
+            */
             InputQueryBuilder queryBuilder;
             OnnxParser::parse( queryBuilder, networkFilePath, {}, {} );
             queryBuilder.generateQuery( _inputQuery );
+            
         }
         else
         {

@@ -16,6 +16,7 @@
 #include "MString.h"
 
 #include "Vector.h"
+#include <iostream>
 
 String::String( Super super )
     : _super( super )
@@ -216,7 +217,23 @@ bool String::endsWith( const String &suffix )
     return l1 >= l2 && _super.compare( l1 - l2, l2, suffix._super ) == 0;
 }
 
-std::ostream &operator<<( std::ostream &stream, const String &string );
+bool String::startsWith( const String &prefix ) const
+{
+    if (prefix.length() > length())
+        return false;
+    for (unsigned i = 0; i < prefix.length(); ++i)
+    {
+        if (_super[i] != prefix._super[i])
+            return false;
+    }
+    return true;
+}
+
+std::ostream &operator<<( std::ostream &stream, const String &string )
+{
+    stream.write(string.ascii(), string.length());
+    return stream;
+}
 
 //
 // Local Variables:

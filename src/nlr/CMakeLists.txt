@@ -1,6 +1,9 @@
 file(GLOB SRCS "*.cpp")
 file(GLOB HEADERS "*.h")
 
+# Remove non-existent files from the build
+list(REMOVE_ITEM SRCS "${CMAKE_CURRENT_SOURCE_DIR}/LiRPAAnalysis.cpp")
+
 target_sources(${MARABOU_LIB} PRIVATE ${SRCS})
 target_include_directories(${MARABOU_LIB} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -15,9 +18,11 @@ macro(network_level_reasoner_add_unit_test name)
 endmacro()
 
 network_level_reasoner_add_unit_test(DeepPolyAnalysis)
+network_level_reasoner_add_unit_test(CROWNAnalysis)
 network_level_reasoner_add_unit_test(NetworkLevelReasoner)
 network_level_reasoner_add_unit_test(WsLayerElimination)
 network_level_reasoner_add_unit_test(ParallelSolver)
+network_level_reasoner_add_unit_test(TorchModel)
 
 if (${ENABLE_GUROBI})
     network_level_reasoner_add_unit_test(LPRelaxation)

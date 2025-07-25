@@ -17,6 +17,20 @@ if (${BUILD_PYTHON})
     target_include_directories(${MARABOU_PY} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+###############
+## PyTorch ##
+###############
+find_package(Torch QUIET)
+if(Torch_FOUND)
+    message(STATUS "Found PyTorch: ${TORCH_LIBRARIES}")
+    target_link_libraries(${MARABOU_LIB} ${TORCH_LIBRARIES})
+    target_link_libraries(${MARABOU_TEST_LIB} ${TORCH_LIBRARIES})
+    target_compile_definitions(${MARABOU_LIB} PRIVATE ENABLE_ONNX_TORCH)
+    target_compile_definitions(${MARABOU_TEST_LIB} PRIVATE ENABLE_ONNX_TORCH)
+else()
+    message(WARNING "PyTorch not found. OnnxToTorch converter will be disabled.")
+endif()
+
 ##################
 ## Parser tests ##
 ##################
@@ -37,6 +51,7 @@ endmacro()
 
 add_parser_unit_test(OnnxParser)
 add_parser_unit_test(VnnLibParser)
+add_parser_unit_test(OnnxToTorch)
 
 ########################
 ## Parser executables ##
@@ -68,4 +83,3 @@ marabou_parser(${MPS_PARSER} ${MPS_DIR})
 # Copy the MPS parser executable to the requested path (used by Python code)
 add_custom_command(TARGET ${MPS_PARSER} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${MPS_PARSER}> ${MPS_PARSER_PATH} )
-

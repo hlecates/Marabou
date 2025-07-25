@@ -103,6 +103,7 @@ endif()
 set(LIBS_INCLUDES ${Boost_INCLUDE_DIRS})
 list(APPEND LIBS ${Boost_LIBRARIES})
 
+
 ##############
 ## Protobuf ##
 ##############
@@ -145,6 +146,30 @@ if(NOT EXISTS "${ONNX_DIR}/onnx.proto3.pb.h")
 endif()
 file(GLOB DEPS_ONNX "${ONNX_DIR}/*.cc")
 include_directories(SYSTEM ${ONNX_DIR})
+
+#############
+## Pytorch ##
+#############
+
+# Sets the version and looks for the torch directory
+
+set(PYTORCH_VERSION 2.2.1)
+set(PYTORCH_DIR "${TOOLS_DIR}/libtorch-${PYTORCH_VERSION}")
+list(APPEND CMAKE_PREFIX_PATH ${PYTORCH_DIR})
+
+# If the directory not found, uses appropite installation script
+
+if(NOT EXISTS "${PYTORCH_DIR}")
+    execute_process(COMMAND ${TOOLS_DIR}/download_libtorch.sh ${PYTORCH_VERSION})
+endif()
+
+# Finds the installation and sets the list of libraries to link, header file locations, and compiler flags
+# TORCH_LIBRARIES is automatially populated by PyTorch's CMake
+
+find_package(Torch ${PYTORCH_VERSION} REQUIRED)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+list(APPEND LIBS ${TORCH_LIBRARIES})
+
 
 ############
 ## Gurobi ##
