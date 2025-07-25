@@ -35,6 +35,8 @@ _deps
 /tools/protobuf*
 /tools/OpenBLAS*
 /tools/onnx*
+/tools/libtorch*/
+tools/libtorch*/**
 
 
 build
@@ -47,3 +49,6 @@ cmake-build-debug/
 /build/
 /wheelhouse/
 .mypy_cache/
+
+# IDE
+.vscode
