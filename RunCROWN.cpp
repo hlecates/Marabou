@@ -32,7 +32,7 @@ NLR::TorchModel* createDeepPolyModel() {
     inputNode->setNodeIndex(0);
     nodes.push_back(inputNode);
     
-    // Create first linear layer (2 -> 2 neurons)
+    // Create first linear layer (2 -> 2 neurons) 
     torch::nn::Linear linear1(torch::nn::LinearOptions(2, 2));
     // Set weights according to the diagram: [1,1; 1,-1]
     linear1->weight = torch::tensor({{1.0, 1.0}, {1.0, -1.0}}, torch::kFloat64);
