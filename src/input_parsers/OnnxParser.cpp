@@ -67,7 +67,7 @@ void OnnxParser::parse( InputQueryBuilder &query,
 
 
 // CHANGES
-std::shared_ptr<TorchModel> OnnxParser::parseAndReturnTorchModel(
+std::shared_ptr<NLR::TorchModel> OnnxParser::parseAndReturnTorchModel(
     InputQueryBuilder &query,
     const String &path,
     const Set<String> initialNodeNames,

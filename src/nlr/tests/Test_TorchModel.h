@@ -1,380 +1,377 @@
-#ifndef __TEST_TORCH_MODEL_H__
-#define __TEST_TORCH_MODEL_H__
+#include "TorchModel.h"
+#include "BoundedInputNode.h"
+#include "BoundedLinearNode.h"
+#include "BoundedReLUNode.h"
+#include "BoundedConstantNode.h"
+#include "FloatUtils.h"
+#include "InputQuery.h"
+#include "MStringf.h"
 
-#include "../TorchModel.h"
-#include "../TorchLinearBounded.h"
-#include "MarabouError.h"
-#include "Vector.h"
-#include "Map.h"
-#include "Set.h"
 #include <cxxtest/TestSuite.h>
 #include <torch/torch.h>
 
 class TorchModelTestSuite : public CxxTest::TestSuite
 {
 public:
-    const double DELTA = 0.0001;
-
-    void test_constructor()
+    void setUp()
     {
-        // Test basic constructor functionality with bounded modules
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices;
-        unsigned outputIndex = 0;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
-
-        // Add a simple linear bounded module
-        auto linear_module = torch::nn::Linear(2, 3);
-        linear_module->weight = torch::tensor({{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}});
-        linear_module->bias = torch::tensor({0.1, 0.2, 0.3});
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear_module));
-        
-        // Add input index
-        inputIndices.append(0);
-        
-        // Add Marabou variables
-        Vector<Variable> testVars;
-        testVars.append(Variable(0));
-        testVars.append(Variable(1));
-        marabouVars.append(testVars);
-        
-        // Add to mapping
-        neuronToMarabouMap[0] = testVars;
-
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE;
-        elementToBoundedModuleIndex[0] = 0;
-
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
-        
-        TS_ASSERT_EQUALS(model.getSize(), 1u);
-        TS_ASSERT_EQUALS(model.getOutputIndex(), 0u);
-        TS_ASSERT_EQUALS(model.getInputIndices().size(), 1u);
-        TS_ASSERT_EQUALS(model.getInputIndices()[0], 0u);
-        TS_ASSERT_EQUALS(model.getVariables().size(), 1u);
-        TS_ASSERT_EQUALS(model.getNeuronToMarabouMap().size(), 1u);
     }
 
-    void test_forward_single_linear()
+    void tearDown()
     {
-        // Test forward pass with a single linear bounded module
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
+    }
+
+    // Helper function to create a simple test model
+    std::shared_ptr<NLR::TorchModel> createSimpleTestModel()
+    {
+        // Create a simple model: Input -> Linear -> ReLU -> Output
+        // Model structure:
+        // Node 0: Input (size 2)
+        // Node 1: Linear (input 2, output 3)
+        // Node 2: ReLU (input 3, output 3)
+        
+        Vector<std::shared_ptr<NLR::BoundedTorchNode>> nodes;
         Vector<Vector<Variable>> marabouVars;
         Vector<unsigned> inputIndices;
         Map<unsigned, Vector<Variable>> neuronToMarabouMap;
         Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
         
-        auto linear = torch::nn::Linear(2, 3);
-        linear->weight = torch::tensor({{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}});
-        linear->bias = torch::tensor({0.1, 0.2, 0.3});
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear));
+        // Create input node (index 0)
+        auto inputNode = std::make_shared<NLR::BoundedInputNode>(0, 2, "input");
+        inputNode->setNodeIndex(0);
+        inputNode->setInputSize(2);
+        inputNode->setOutputSize(2);
+        nodes.append(inputNode);
         
-        inputIndices.append(1); // Input is at element index 1
+        // Create linear node (index 1) - need to create a torch::nn::Linear module
+        torch::nn::Linear linearModule = torch::nn::Linear(2, 3);
+        // Set weights and bias manually
+        linearModule->weight = torch::tensor({{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}}, torch::kFloat32);
+        linearModule->bias = torch::tensor({0.1, 0.2, 0.3}, torch::kFloat32);
         
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE; // Linear
-        elementTypes[1] = ElementType::INPUT;  // Input
+        auto linearNode = std::make_shared<NLR::BoundedLinearNode>(linearModule, 1.0f, "linear");
+        linearNode->setNodeIndex(1);
+        linearNode->setInputSize(2);
+        linearNode->setOutputSize(3);
+        nodes.append(linearNode);
         
-        elementToBoundedModuleIndex[0] = 0; // Linear -> bounded module 0
-        elementToInputIndex[1] = 0;  // Input -> input 0
+        // Create ReLU node (index 2) - need to create a torch::nn::ReLU module
+        torch::nn::ReLU reluModule = torch::nn::ReLU();
+        auto reluNode = std::make_shared<NLR::BoundedReLUNode>(reluModule, "relu");
+        reluNode->setNodeIndex(2);
+        reluNode->setInputSize(3);
+        reluNode->setOutputSize(3);
+        nodes.append(reluNode);
         
-        dependencies[0] = Vector<unsigned>{1}; // Linear depends on input
+        // Set input indices
+        inputIndices.append(0);
         
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, 0, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
-        torch::Tensor input = torch::tensor({1.0, 2.0});
-        torch::Tensor expected = torch::matmul(input, linear->weight.t()) + linear->bias;
+        // Set dependencies
+        dependencies[1] = Vector<unsigned>{0};  // Linear depends on Input
+        dependencies[2] = Vector<unsigned>{1};  // ReLU depends on Linear
         
-        // Use the correct input mapping: element index 1 maps to input index 0
-        Map<unsigned, torch::Tensor> inputs;
-        inputs[0] = input; // Use input index 0, not element index 1
-        torch::Tensor output = model.forward(inputs);
-        TS_ASSERT_EQUALS(output.sizes().size(), expected.sizes().size());
-        TS_ASSERT_EQUALS(output.numel(), expected.numel());
-        for (int i = 0; i < output.numel(); ++i) {
-            TS_ASSERT_DELTA(output[i].item<double>(), expected[i].item<double>(), DELTA);
+        // Create Marabou variables (simplified for testing)
+        for (unsigned i = 0; i < nodes.size(); ++i) {
+            Vector<Variable> vars;
+            unsigned outputSize = nodes[i]->getOutputSize();
+            for (unsigned j = 0; j < outputSize; ++j) {
+                vars.append(Variable(i * 10 + j));  // Simple variable assignment
+            }
+            marabouVars.append(vars);
+            neuronToMarabouMap[i] = vars;
         }
+        
+        // Output index is the last node (ReLU)
+        unsigned outputIndex = 2;
+        
+        return std::make_shared<NLR::TorchModel>(nodes, marabouVars, inputIndices, 
+                                                outputIndex, neuronToMarabouMap, dependencies);
     }
 
-    void test_forward_linear_chain()
+    void test_constructor_and_basic_getters()
     {
-        // Test forward pass with two linear bounded modules in sequence
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
+        std::shared_ptr<NLR::TorchModel> model = createSimpleTestModel();
         
-        auto linear1 = torch::nn::Linear(2, 3);
-        linear1->weight = torch::tensor({{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}});
-        linear1->bias = torch::tensor({0.1, 0.2, 0.3});
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear1));
+        // Test basic getters
+        TS_ASSERT_EQUALS(model->getNumNodes(), 3u);
+        TS_ASSERT_EQUALS(model->getInputSize(), 2u);
+        TS_ASSERT_EQUALS(model->getOutputSize(), 3u);
+        TS_ASSERT_EQUALS(model->getOutputIndex(), 2u);
         
-        auto linear2 = torch::nn::Linear(3, 1);
-        linear2->weight = torch::tensor({{1.0, 2.0, 3.0}});
-        linear2->bias = torch::tensor({0.5});
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear2));
+        // Test input indices
+        const Vector<unsigned>& inputIndices = model->getInputIndices();
+        TS_ASSERT_EQUALS(inputIndices.size(), 1u);
+        TS_ASSERT_EQUALS(inputIndices[0], 0u);
         
-        inputIndices.append(2); // Input is at element index 2
+        // Test node access
+        auto inputNode = model->getNode(0);
+        TS_ASSERT(inputNode != nullptr);
+        TS_ASSERT_EQUALS(inputNode->getNodeType(), NLR::NodeType::INPUT);
+        TS_ASSERT_EQUALS(inputNode->getOutputSize(), 2u);
         
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE; // Linear1
-        elementTypes[1] = ElementType::MODULE; // Linear2
-        elementTypes[2] = ElementType::INPUT;  // Input
+        auto linearNode = model->getNode(1);
+        TS_ASSERT(linearNode != nullptr);
+        TS_ASSERT_EQUALS(linearNode->getNodeType(), NLR::NodeType::LINEAR);
+        TS_ASSERT_EQUALS(linearNode->getInputSize(), 2u);
+        TS_ASSERT_EQUALS(linearNode->getOutputSize(), 3u);
         
-        elementToBoundedModuleIndex[0] = 0; // Linear1 -> bounded module 0
-        elementToBoundedModuleIndex[1] = 1; // Linear2 -> bounded module 1
-        elementToInputIndex[2] = 0;  // Input -> input 0
+        auto reluNode = model->getNode(2);
+        TS_ASSERT(reluNode != nullptr);
+        TS_ASSERT_EQUALS(reluNode->getNodeType(), NLR::NodeType::RELU);
+        TS_ASSERT_EQUALS(reluNode->getInputSize(), 3u);
+        TS_ASSERT_EQUALS(reluNode->getOutputSize(), 3u);
         
-        dependencies[0] = Vector<unsigned>{2}; // Linear1 depends on input
-        dependencies[1] = Vector<unsigned>{0}; // Linear2 depends on Linear1
+        // Test node indices
+        Vector<unsigned> allIndices = model->getAllNodeIndices();
+        TS_ASSERT_EQUALS(allIndices.size(), 3u);
+        TS_ASSERT_EQUALS(allIndices[0], 0u);
+        TS_ASSERT_EQUALS(allIndices[1], 1u);
+        TS_ASSERT_EQUALS(allIndices[2], 2u);
         
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, 1, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
-        torch::Tensor input = torch::tensor({1.0, 2.0});
-        torch::Tensor layer1_output = torch::matmul(input, linear1->weight.t()) + linear1->bias;
-        torch::Tensor expected = torch::matmul(layer1_output, linear2->weight.t()) + linear2->bias;
+        // Test nodes by type
+        Vector<unsigned> inputNodes = model->getNodesByType(NLR::NodeType::INPUT);
+        TS_ASSERT_EQUALS(inputNodes.size(), 1u);
+        TS_ASSERT_EQUALS(inputNodes[0], 0u);
         
-        // Use the correct input mapping: element index 2 maps to input index 0
-        Map<unsigned, torch::Tensor> inputs;
-        inputs[0] = input; // Use input index 0, not element index 2
-        torch::Tensor output = model.forward(inputs);
-        TS_ASSERT_EQUALS(output.sizes().size(), expected.sizes().size());
-        TS_ASSERT_EQUALS(output.numel(), expected.numel());
-        for (int i = 0; i < output.numel(); ++i) {
-            TS_ASSERT_DELTA(output[i].item<double>(), expected[i].item<double>(), DELTA);
-        }
+        Vector<unsigned> linearNodes = model->getNodesByType(NLR::NodeType::LINEAR);
+        TS_ASSERT_EQUALS(linearNodes.size(), 1u);
+        TS_ASSERT_EQUALS(linearNodes[0], 1u);
+        
+        Vector<unsigned> reluNodes = model->getNodesByType(NLR::NodeType::RELU);
+        TS_ASSERT_EQUALS(reluNodes.size(), 1u);
+        TS_ASSERT_EQUALS(reluNodes[0], 2u);
+        
+        // Test dependencies
+        Vector<unsigned> deps1 = model->getDependencies(1);
+        TS_ASSERT_EQUALS(deps1.size(), 1u);
+        TS_ASSERT_EQUALS(deps1[0], 0u);
+        
+        Vector<unsigned> deps2 = model->getDependencies(2);
+        TS_ASSERT_EQUALS(deps2.size(), 1u);
+        TS_ASSERT_EQUALS(deps2[0], 1u);
+        
+        // Test dependents
+        Vector<unsigned> dependents0 = model->getDependents(0);
+        TS_ASSERT_EQUALS(dependents0.size(), 1u);
+        TS_ASSERT_EQUALS(dependents0[0], 1u);
+        
+        Vector<unsigned> dependents1 = model->getDependents(1);
+        TS_ASSERT_EQUALS(dependents1.size(), 1u);
+        TS_ASSERT_EQUALS(dependents1[0], 2u);
+        
+        // Test degrees
+        TS_ASSERT_EQUALS(model->getDegreeIn(0), 0u);   // Input has no dependencies
+        TS_ASSERT_EQUALS(model->getDegreeIn(1), 1u);   // Linear has 1 dependency
+        TS_ASSERT_EQUALS(model->getDegreeIn(2), 1u);   // ReLU has 1 dependency
+        
+        TS_ASSERT_EQUALS(model->getDegreeOut(0), 1u);  // Input has 1 dependent
+        TS_ASSERT_EQUALS(model->getDegreeOut(1), 1u);  // Linear has 1 dependent
+        TS_ASSERT_EQUALS(model->getDegreeOut(2), 0u);  // ReLU has no dependents
+        
+        // Test roots and leaves
+        Vector<unsigned> roots = model->getRoots();
+        TS_ASSERT_EQUALS(roots.size(), 1u);
+        TS_ASSERT_EQUALS(roots[0], 0u);
+        
+        Vector<unsigned> leaves = model->getLeaves();
+        TS_ASSERT_EQUALS(leaves.size(), 1u);
+        TS_ASSERT_EQUALS(leaves[0], 2u);
+        
+        // Test topological sort
+        Vector<unsigned> topoSort = model->topologicalSort();
+        TS_ASSERT_EQUALS(topoSort.size(), 3u);
+        TS_ASSERT_EQUALS(topoSort[0], 0u);  // Input first
+        TS_ASSERT_EQUALS(topoSort[1], 1u);  // Linear second
+        TS_ASSERT_EQUALS(topoSort[2], 2u);  // ReLU last
     }
 
-    void test_eliminate_variable()
+    void test_forward_pass_and_activations()
     {
-        // Test variable elimination functionality
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices;
-        unsigned outputIndex = 0;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
-
-        auto linear = torch::nn::Linear(2, 3);
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear));
+        std::shared_ptr<NLR::TorchModel> model = createSimpleTestModel();
         
-        Vector<Variable> testVars;
-        testVars.append(Variable(0));
-        testVars.append(Variable(1));
-        marabouVars.append(testVars);
+        // Create test input tensor
+        torch::Tensor input = torch::tensor({1.0, 2.0}, torch::kFloat32);
         
-        neuronToMarabouMap[0] = testVars;
+        // Test forward pass with activations
+        Map<unsigned, torch::Tensor> activations = model->forwardAndStoreActivations(input);
         
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE;
-        elementToBoundedModuleIndex[0] = 0;
-
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
+        // Verify that activations were computed for all nodes
+        TS_ASSERT_EQUALS(activations.size(), 3u);
+        TS_ASSERT(activations.exists(0));
+        TS_ASSERT(activations.exists(1));
+        TS_ASSERT(activations.exists(2));
         
-        // Test elimination
-        model.eliminateVariable(0, 5.0);
-        TS_ASSERT(model.neuronEliminated(0));
-        TS_ASSERT_DELTA(model.getEliminatedNeuronValue(0), 5.0, DELTA);
+        // Test input node activation (should be the input itself)
+        torch::Tensor inputActivation = activations[0];
+        TS_ASSERT(inputActivation.defined());
+        TS_ASSERT_EQUALS(inputActivation.numel(), 2);
+        TS_ASSERT_DELTA(inputActivation[0].item<float>(), 1.0f, 1e-6);
+        TS_ASSERT_DELTA(inputActivation[1].item<float>(), 2.0f, 1e-6);
+        
+        // Test linear node activation
+        // Expected: linear(x) = W * x + b
+        // W = [[1, 2], [3, 4], [5, 6]], b = [0.1, 0.2, 0.3]
+        // x = [1, 2]
+        // Expected: [1*1 + 2*2 + 0.1, 1*3 + 2*4 + 0.2, 1*5 + 2*6 + 0.3]
+        // = [1 + 4 + 0.1, 3 + 8 + 0.2, 5 + 12 + 0.3]
+        // = [5.1, 11.2, 17.3]
+        torch::Tensor linearActivation = activations[1];
+        TS_ASSERT(linearActivation.defined());
+        TS_ASSERT_EQUALS(linearActivation.numel(), 3);
+        TS_ASSERT_DELTA(linearActivation[0].item<float>(), 5.1f, 1e-6);
+        TS_ASSERT_DELTA(linearActivation[1].item<float>(), 11.2f, 1e-6);
+        TS_ASSERT_DELTA(linearActivation[2].item<float>(), 17.3f, 1e-6);
+        
+        // Test ReLU node activation
+        // Expected: ReLU([5.1, 11.2, 17.3]) = [5.1, 11.2, 17.3] (all positive)
+        torch::Tensor reluActivation = activations[2];
+        TS_ASSERT(reluActivation.defined());
+        TS_ASSERT_EQUALS(reluActivation.numel(), 3);
+        TS_ASSERT_DELTA(reluActivation[0].item<float>(), 5.1f, 1e-6);
+        TS_ASSERT_DELTA(reluActivation[1].item<float>(), 11.2f, 1e-6);
+        TS_ASSERT_DELTA(reluActivation[2].item<float>(), 17.3f, 1e-6);
+        
+        // Test with negative input to verify ReLU works
+        torch::Tensor negativeInput = torch::tensor({-1.0, -2.0}, torch::kFloat32);
+        Map<unsigned, torch::Tensor> negativeActivations = model->forwardAndStoreActivations(negativeInput);
+        
+        // Linear output with negative input: W * [-1, -2] + b
+        // = [(-1)*1 + (-2)*2 + 0.1, (-1)*3 + (-2)*4 + 0.2, (-1)*5 + (-2)*6 + 0.3]
+        // = [-1 - 4 + 0.1, -3 - 8 + 0.2, -5 - 12 + 0.3]
+        // = [-4.9, -10.8, -16.7]
+        torch::Tensor negativeLinearActivation = negativeActivations[1];
+        TS_ASSERT_DELTA(negativeLinearActivation[0].item<float>(), -4.9f, 1e-6);
+        TS_ASSERT_DELTA(negativeLinearActivation[1].item<float>(), -10.8f, 1e-6);
+        TS_ASSERT_DELTA(negativeLinearActivation[2].item<float>(), -16.7f, 1e-6);
+        
+        // ReLU output with negative input: ReLU([-4.9, -10.8, -16.7]) = [0, 0, 0]
+        torch::Tensor negativeReluActivation = negativeActivations[2];
+        TS_ASSERT_DELTA(negativeReluActivation[0].item<float>(), 0.0f, 1e-6);
+        TS_ASSERT_DELTA(negativeReluActivation[1].item<float>(), 0.0f, 1e-6);
+        TS_ASSERT_DELTA(negativeReluActivation[2].item<float>(), 0.0f, 1e-6);
     }
 
-    void test_update_variable_indices()
+    void test_input_bounds_functionality()
     {
-        // Test variable index updating functionality
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices;
-        unsigned outputIndex = 0;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
-
-        auto linear = torch::nn::Linear(2, 3);
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear));
+        std::shared_ptr<NLR::TorchModel> model = createSimpleTestModel();
         
-        Vector<Variable> testVars;
-        testVars.append(Variable(0));
-        testVars.append(Variable(1));
-        marabouVars.append(testVars);
+        // Initially, no input bounds should be set
+        TS_ASSERT(!model->hasInputBounds());
         
-        neuronToMarabouMap[0] = testVars;
+        // Create input bounds
+        torch::Tensor inputLower = torch::tensor({-1.0, -2.0}, torch::kFloat32);
+        torch::Tensor inputUpper = torch::tensor({1.0, 2.0}, torch::kFloat32);
+        BoundedTensor<torch::Tensor> inputBounds(inputLower, inputUpper);
         
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE;
-        elementToBoundedModuleIndex[0] = 0;
-
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
+        // Set input bounds
+        model->setInputBounds(inputBounds);
         
-        // Create index mapping
-        Map<unsigned, unsigned> oldIndexToNewIndex;
-        oldIndexToNewIndex[0] = 10;
-        oldIndexToNewIndex[1] = 11;
+        // Verify input bounds are set
+        TS_ASSERT(model->hasInputBounds());
         
-        Map<unsigned, unsigned> mergedVariables;
-        mergedVariables[2] = 10;
-        mergedVariables[3] = 11;
+        // Test getting input bounds
+        BoundedTensor<torch::Tensor> retrievedBounds = model->getInputBounds();
+        TS_ASSERT(retrievedBounds.lower().defined());
+        TS_ASSERT(retrievedBounds.upper().defined());
+        TS_ASSERT_EQUALS(retrievedBounds.lower().numel(), 2);
+        TS_ASSERT_EQUALS(retrievedBounds.upper().numel(), 2);
         
-        model.updateVariableIndices(oldIndexToNewIndex, mergedVariables);
+        // Test individual bound access
+        torch::Tensor retrievedLower = model->getInputLowerBounds();
+        torch::Tensor retrievedUpper = model->getInputUpperBounds();
         
-        // Test that the mapping was updated correctly
-        TS_ASSERT_EQUALS(model.getNeuronToMarabouMap().size(), 1u);
+        TS_ASSERT_DELTA(retrievedLower[0].item<float>(), -1.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedLower[1].item<float>(), -2.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpper[0].item<float>(), 1.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpper[1].item<float>(), 2.0f, 1e-6);
+        
+        // Test with different bounds
+        torch::Tensor newInputLower = torch::tensor({0.0, 0.5}, torch::kFloat32);
+        torch::Tensor newInputUpper = torch::tensor({3.0, 3.5}, torch::kFloat32);
+        BoundedTensor<torch::Tensor> newInputBounds(newInputLower, newInputUpper);
+        
+        model->setInputBounds(newInputBounds);
+        
+        // Verify new bounds are set
+        TS_ASSERT(model->hasInputBounds());
+        
+        torch::Tensor newRetrievedLower = model->getInputLowerBounds();
+        torch::Tensor newRetrievedUpper = model->getInputUpperBounds();
+        
+        TS_ASSERT_DELTA(newRetrievedLower[0].item<float>(), 0.0f, 1e-6);
+        TS_ASSERT_DELTA(newRetrievedLower[1].item<float>(), 0.5f, 1e-6);
+        TS_ASSERT_DELTA(newRetrievedUpper[0].item<float>(), 3.0f, 1e-6);
+        TS_ASSERT_DELTA(newRetrievedUpper[1].item<float>(), 3.5f, 1e-6);
     }
 
-    void test_getters()
+    void test_concrete_bounds_functionality()
     {
-        // Test all getter methods
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices;
-        unsigned outputIndex = 1;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
-
-        // Add bounded modules
-        auto linear1 = torch::nn::Linear(2, 3);
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear1));
+        std::shared_ptr<NLR::TorchModel> model = createSimpleTestModel();
         
-        auto linear2 = torch::nn::Linear(3, 1);
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear2));
+        // Initially, no concrete bounds should be set for any node
+        TS_ASSERT(!model->hasConcreteBounds(0));
+        TS_ASSERT(!model->hasConcreteBounds(1));
+        TS_ASSERT(!model->hasConcreteBounds(2));
         
-        // Add constants
-        constants.append(torch::tensor({1.0, 2.0}));
-        constants.append(torch::tensor({})); // Empty tensor
+        // Set concrete bounds for linear node (index 1)
+        torch::Tensor linearLower = torch::tensor({-5.0, -10.0, -15.0}, torch::kFloat32);
+        torch::Tensor linearUpper = torch::tensor({5.0, 10.0, 15.0}, torch::kFloat32);
+        BoundedTensor<torch::Tensor> linearBounds(linearLower, linearUpper);
         
-        // Add input indices
-        inputIndices.append(0);
+        model->setConcreteBounds(1, linearBounds);
         
-        // Add Marabou variables
-        Vector<Variable> inputVars;
-        inputVars.append(Variable(0));
-        inputVars.append(Variable(1));
-        marabouVars.append(inputVars);
+        // Verify concrete bounds are set for linear node
+        TS_ASSERT(model->hasConcreteBounds(1));
+        TS_ASSERT(!model->hasConcreteBounds(0));
+        TS_ASSERT(!model->hasConcreteBounds(2));
         
-        Vector<Variable> outputVars;
-        outputVars.append(Variable(2));
-        marabouVars.append(outputVars);
+        // Test getting concrete bounds
+        BoundedTensor<torch::Tensor> retrievedLinearBounds = model->getConcreteBounds(1);
+        TS_ASSERT(retrievedLinearBounds.lower().defined());
+        TS_ASSERT(retrievedLinearBounds.upper().defined());
+        TS_ASSERT_EQUALS(retrievedLinearBounds.lower().numel(), 3);
+        TS_ASSERT_EQUALS(retrievedLinearBounds.upper().numel(), 3);
         
-        neuronToMarabouMap[0] = inputVars;
-        neuronToMarabouMap[1] = outputVars;
-
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE;
-        elementTypes[1] = ElementType::MODULE;
-        elementToBoundedModuleIndex[0] = 0;
-        elementToBoundedModuleIndex[1] = 1;
-
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
+        TS_ASSERT_DELTA(retrievedLinearBounds.lower()[0].item<float>(), -5.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedLinearBounds.lower()[1].item<float>(), -10.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedLinearBounds.lower()[2].item<float>(), -15.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedLinearBounds.upper()[0].item<float>(), 5.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedLinearBounds.upper()[1].item<float>(), 10.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedLinearBounds.upper()[2].item<float>(), 15.0f, 1e-6);
         
-        // Test all getters
-        TS_ASSERT_EQUALS(model.getBoundedModules().size(), 2u);
-        TS_ASSERT_EQUALS(model.getVariables().size(), 2u);
-        TS_ASSERT_EQUALS(model.getInputIndices().size(), 1u);
-        TS_ASSERT_EQUALS(model.getOutputIndex(), 1u);
-        TS_ASSERT_EQUALS(model.getSize(), 2u);
-        TS_ASSERT_EQUALS(model.getNeuronToMarabouMap().size(), 2u);
+        // Set concrete bounds for ReLU node (index 2)
+        torch::Tensor reluLower = torch::tensor({0.0, 0.0, 0.0}, torch::kFloat32);
+        torch::Tensor reluUpper = torch::tensor({10.0, 20.0, 30.0}, torch::kFloat32);
+        BoundedTensor<torch::Tensor> reluBounds(reluLower, reluUpper);
         
-        // Test specific values
-        TS_ASSERT_EQUALS(model.getInputIndices()[0], 0u);
-        TS_ASSERT_EQUALS(model.getVariables()[0].size(), 2u);
-        TS_ASSERT_EQUALS(model.getVariables()[1].size(), 1u);
-    }
-
-    void test_error_handling()
-    {
-        // Test error handling for invalid inputs
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices; // Empty input indices
-        unsigned outputIndex = 0;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
-
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
+        model->setConcreteBounds(2, reluBounds);
         
-        // Test forward pass with no input indices
-        torch::Tensor input = torch::tensor({1.0, 2.0});
-        TS_ASSERT_THROWS_EQUALS(
-            model.forward(input),
-            const MarabouError& e,
-            e.getCode(),
-            MarabouError::TORCH_MODEL_ERROR
-        );
-    }
-
-    void test_eliminated_neuron_value()
-    {
-        // Test getting eliminated neuron values
-        Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-        Vector<torch::Tensor> constants;
-        Vector<Vector<Variable>> marabouVars;
-        Vector<unsigned> inputIndices;
-        unsigned outputIndex = 0;
-        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
-        Map<unsigned, Vector<unsigned>> dependencies;
-        Map<unsigned, ElementType> elementTypes;
-        Map<unsigned, unsigned> elementToBoundedModuleIndex;
-        Map<unsigned, unsigned> elementToConstantIndex;
-        Map<unsigned, unsigned> elementToInputIndex;
-
-        auto linear = torch::nn::Linear(2, 3);
-        boundedModules.append(std::make_shared<NLR::TorchLinearModule>(linear));
-        inputIndices.append(0);
+        // Verify concrete bounds are set for ReLU node
+        TS_ASSERT(model->hasConcreteBounds(2));
         
-        Vector<Variable> testVars;
-        testVars.append(Variable(0));
-        marabouVars.append(testVars);
+        // Test getting ReLU concrete bounds
+        BoundedTensor<torch::Tensor> retrievedReluBounds = model->getConcreteBounds(2);
+        TS_ASSERT_DELTA(retrievedReluBounds.lower()[0].item<float>(), 0.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedReluBounds.lower()[1].item<float>(), 0.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedReluBounds.lower()[2].item<float>(), 0.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedReluBounds.upper()[0].item<float>(), 10.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedReluBounds.upper()[1].item<float>(), 20.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedReluBounds.upper()[2].item<float>(), 30.0f, 1e-6);
         
-        neuronToMarabouMap[0] = testVars;
-
-        // Set up element types and mappings
-        elementTypes[0] = ElementType::MODULE;
-        elementToBoundedModuleIndex[0] = 0;
-
-        TorchModel model(boundedModules, constants, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, dependencies, elementTypes, elementToBoundedModuleIndex, elementToConstantIndex, elementToInputIndex);
+        // Test updating existing bounds
+        torch::Tensor updatedLinearLower = torch::tensor({-3.0, -8.0, -12.0}, torch::kFloat32);
+        torch::Tensor updatedLinearUpper = torch::tensor({3.0, 8.0, 12.0}, torch::kFloat32);
+        BoundedTensor<torch::Tensor> updatedLinearBounds(updatedLinearLower, updatedLinearUpper);
         
-        // Eliminate a variable
-        model.eliminateVariable(Variable(0), 7.5);
+        model->setConcreteBounds(1, updatedLinearBounds);
         
-        // Test getting the eliminated value
-        TS_ASSERT_DELTA(model.getEliminatedNeuronValue(0), 7.5, DELTA);
-        
-        // Test that non-eliminated neurons throw error
-        TS_ASSERT_THROWS(model.getEliminatedNeuronValue(1), const MarabouError&);
+        // Verify updated bounds
+        BoundedTensor<torch::Tensor> retrievedUpdatedBounds = model->getConcreteBounds(1);
+        TS_ASSERT_DELTA(retrievedUpdatedBounds.lower()[0].item<float>(), -3.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpdatedBounds.lower()[1].item<float>(), -8.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpdatedBounds.lower()[2].item<float>(), -12.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpdatedBounds.upper()[0].item<float>(), 3.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpdatedBounds.upper()[1].item<float>(), 8.0f, 1e-6);
+        TS_ASSERT_DELTA(retrievedUpdatedBounds.upper()[2].item<float>(), 12.0f, 1e-6);
     }
 };
-
-#endif // __TEST_TORCH_MODEL_H__

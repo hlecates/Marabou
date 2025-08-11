@@ -352,6 +352,12 @@ target_compile_options(${MARABOU_LIB} PRIVATE ${RELEASE_FLAGS})
 target_link_libraries(${MARABOU_EXE} ${MARABOU_LIB})
 target_include_directories(${MARABOU_EXE} PRIVATE ${LIBS_INCLUDES})
 
+# Build RunCROWN executable
+add_executable(RunCROWN RunCROWN.cpp)
+target_link_libraries(RunCROWN ${MARABOU_LIB})
+target_include_directories(RunCROWN PRIVATE ${LIBS_INCLUDES})
+target_compile_options(RunCROWN PRIVATE ${RELEASE_FLAGS})
+
 ######################
 ## Build Python API ##
 ######################

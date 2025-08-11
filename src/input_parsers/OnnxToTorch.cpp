@@ -16,11 +16,13 @@
 
 #include "OnnxToTorch.h"
 #include "../nlr/TorchModel.h"
-#include "../nlr/TorchLinearBounded.h"
-#include "../nlr/TorchReLUBounded.h"
-#include "../nlr/TorchIdentityBounded.h"
-#include "../nlr/TorchReshapeBounded.h"
-#include "../nlr/TorchConstantBounded.h"
+#include "../nlr/BoundedTorchNode.h"
+#include "../nlr/BoundedConstantNode.h"
+#include "../nlr/BoundedInputNode.h"
+#include "../nlr/BoundedLinearNode.h"
+#include "../nlr/BoundedReLUNode.h"
+#include "../nlr/BoundedIdentityNode.h"
+#include "../nlr/BoundedReshapeNode.h"
 #include "MarabouError.h"
 #include "File.h"
 #include "MString.h"
@@ -323,14 +325,12 @@ OnnxToTorchParser::OnnxToTorchParser(const String &path) {
     _onnx_model = model;
 }
 
-std::shared_ptr<TorchModel> OnnxToTorchParser::parse(const String &path, const Map<String, Vector<Variable>>& marabouVarMap) {
-    std::cerr << "[OnnxToTorchParser] Starting parse for file: " << path << std::endl << std::flush;
+std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::parse(const String &path, const Map<String, Vector<Variable>>& marabouVarMap) {
     OnnxToTorchParser parser(path);
-    std::cerr << "[OnnxToTorchParser] Parser created, processing graph..." << std::endl << std::flush;
     return parser.processGraph(marabouVarMap);
 }
 
-std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Vector<Variable>>& marabouVarMap) {
+std::shared_ptr<NLR::TorchModel> OnnxToTorchParser::processGraph(const Map<String, Vector<Variable>>& marabouVarMap) {
     // Process initializers
     Map<String, onnx::TensorProto> name_to_initializer;
     for (const auto& initializer : _onnx_model.graph().initializer()) {
@@ -389,15 +389,36 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
     }
     std::cerr << std::endl << std::flush;
 
-    // Build model components using indices - only bounded modules
-    Vector<std::shared_ptr<NLR::ITorchModuleBounded>> boundedModules;
-    Vector<torch::Tensor> constants;
+    // Build model components using unified nodes
+    Vector<std::shared_ptr<NLR::BoundedTorchNode>> nodes;
     Vector<Vector<Variable>> marabouVars(processingOrder.size());
     Vector<unsigned> inputIndices;
     unsigned outputIndex = 0;
 
+    // Debug: Show expected output tensor name
+    String expectedOutputName;
+    if (_onnx_model.graph().output_size() > 0) {
+        expectedOutputName = _onnx_model.graph().output(0).name();
+        std::cerr << "[OnnxToTorchParser] Expected output tensor name: " << expectedOutputName << std::endl << std::flush;
+    } else {
+        std::cerr << "[OnnxToTorchParser] No outputs found in graph" << std::endl << std::flush;
+    }
+
     // Create constants map for operations
     Map<String, torch::Tensor> constantsMap;
+
+    // Map input names to their corresponding constants for operations
+    // This needs to happen BEFORE node processing so constants are available
+    for (const auto& node : _onnx_model.graph().node()) {
+        for (int i = 0; i < node.input_size(); ++i) {
+            String inputName = node.input(i);
+            // If this input name corresponds to a constant, add it to the constants map
+            if (name_to_initializer.exists(inputName) && !constantsMap.exists(inputName)) {
+                torch::Tensor constant = ConstantProcessor::processInitializer(name_to_initializer[inputName]);
+                constantsMap[inputName] = constant;
+            }
+        }
+    }
 
     // Map names to indices for lookup
     Map<String, unsigned> nameToIndex;
@@ -408,34 +429,20 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
     // Construct complete neuron-to-Marabou mapping
     Map<unsigned, Vector<Variable>> neuronToMarabouMap;
 
-    // Build dependency map: element index -> input element indices
+    // Build dependency map: node index -> input node indices
     Map<unsigned, Vector<unsigned>> dependencies;
-
-    // Mapping system for type safety
-    Map<unsigned, ElementType> elementTypes;
-    Map<unsigned, unsigned> elementToBoundedModuleIndex;
-    Map<unsigned, unsigned> elementToConstantIndex;
-    Map<unsigned, unsigned> elementToInputIndex;
-
-    // Track indices for each type
-    unsigned boundedModuleIndex = 0;
-    unsigned constantIndex = 0;
-    unsigned inputIndex = 0;
 
     // Process each tensor in processing order
     for (unsigned i = 0; i < processingOrder.size(); ++i) {
         const String& tensorName = processingOrder[i];
         std::cerr << "[OnnxToTorchParser] Processing tensor " << i << ": " << tensorName << std::endl << std::flush;
 
-        // Handle initializers (constants) - these should be processed first
+        // Handle initializers (constants)
         if (name_to_initializer.exists(tensorName)) {
             torch::Tensor constant = ConstantProcessor::processInitializer(name_to_initializer[tensorName]);
-            constants.append(constant);
-            constantsMap[tensorName] = constant;
-            elementTypes[i] = ElementType::CONSTANT;
-            elementToConstantIndex[i] = constantIndex;
-            std::cerr << "  Stored constant at index " << i << " (constant index " << constantIndex << ")" << std::endl << std::flush;
-            constantIndex++;
+            auto constantNode = std::make_shared<NLR::BoundedConstantNode>(constant, tensorName);
+            constantNode->setNodeIndex(i);
+            nodes.append(constantNode);
             
             if (marabouVarMap.exists(tensorName)) {
                 neuronToMarabouMap[i] = marabouVarMap[tensorName];
@@ -444,19 +451,17 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
             continue;
         }
 
-        // Handle Constant nodes - these should also be processed before dependent nodes
+        // Handle Constant nodes
         if (name_to_node.exists(tensorName)) {
             const auto& node = name_to_node[tensorName];
             std::cerr << "  Found node with op_type: " << node.op_type() << std::endl << std::flush;
             if (node.op_type() == "Constant") {
                 std::cerr << "  Processing as Constant node" << std::endl << std::flush;
                 try {
-                    constants.append(ConstantProcessor::processConstantNode(node));
-                    constantsMap[tensorName] = constants[constantIndex];
-                    elementTypes[i] = ElementType::CONSTANT;
-                    elementToConstantIndex[i] = constantIndex;
-                    std::cerr << "  Stored constant from Constant node at index " << i << " (constant index " << constantIndex << ")" << std::endl << std::flush;
-                    constantIndex++;
+                    torch::Tensor constant = ConstantProcessor::processConstantNode(node);
+                    auto constantNode = std::make_shared<NLR::BoundedConstantNode>(constant, tensorName);
+                    constantNode->setNodeIndex(i);
+                    nodes.append(constantNode);
                     
                     if (marabouVarMap.exists(tensorName)) {
                         neuronToMarabouMap[i] = marabouVarMap[tensorName];
@@ -477,10 +482,21 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
         // Handle inputs
         if (name_to_input.exists(tensorName) && !name_to_initializer.exists(tensorName)) {
             inputIndices.append(i);
-            elementTypes[i] = ElementType::INPUT;
-            elementToInputIndex[i] = inputIndex;
-            std::cerr << "  Assigned input at index " << i << " (input index " << inputIndex << ")" << std::endl << std::flush;
-            inputIndex++;
+            
+            // Get input size from the input info
+            unsigned inputSize = 1; // Default, should be extracted from input info
+            TensorShape inputShape = BoundedOperationConverter::extractShapeFromNode(onnx::NodeProto(), name_to_input, name_to_initializer, tensorName);
+            if (!inputShape.empty()) {
+                inputSize = BoundedOperationConverter::computeTensorSize(inputShape);
+                std::cout << "[DEBUG] Input tensor " << tensorName << " shape: ";
+                for (unsigned dim : inputShape) {
+                    std::cout << dim << " ";
+                }
+                std::cout << ", computed size: " << inputSize << std::endl;
+            }
+            auto inputNode = std::make_shared<NLR::BoundedInputNode>(i, inputSize, tensorName);
+            inputNode->setNodeIndex(i);
+            nodes.append(inputNode);
             
             if (marabouVarMap.exists(tensorName)) {
                 neuronToMarabouMap[i] = marabouVarMap[tensorName];
@@ -489,21 +505,16 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
             continue;
         }
 
-        // Handle node outputs - create bounded modules (non-Constant nodes)
+        // Handle node outputs - create bounded nodes
         if (name_to_node.exists(tensorName)) {
             const auto& node = name_to_node[tensorName];
 
-            // This is a bounded module - assign it a bounded module index
-            elementTypes[i] = ElementType::MODULE;
-            elementToBoundedModuleIndex[i] = boundedModuleIndex;
-
-            // Build input dependencies for this node - only include non-constant inputs
+            // Build input dependencies for this node
             Vector<unsigned> deps;
             for (int j = 0; j < node.input_size(); ++j) {
                 String inputName = node.input(j);
                 if (nameToIndex.exists(inputName)) {
                     unsigned inputIndex = nameToIndex[inputName];
-                    // Only add as dependency if it's not a constant (has no initializer)
                     if (!name_to_initializer.exists(inputName)) {
                         deps.append(inputIndex);
                     }
@@ -516,30 +527,33 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
                 std::cerr << std::endl << std::flush;
             }
 
-            // Convert node to bounded module
+            // Convert node to bounded node with enhanced size setting
+            std::shared_ptr<NLR::BoundedTorchNode> boundedNode;
+            
             try {
                 if (node.op_type() == "Identity") {
-                    boundedModules.append(BoundedOperationConverter::convertIdentity(node));
+                    boundedNode = BoundedOperationConverter::convertIdentity(node, name_to_input, name_to_initializer);
                 } else if (node.op_type() == "Gemm") {
-                    boundedModules.append(BoundedOperationConverter::convertGemm(node, constantsMap));
+                    boundedNode = BoundedOperationConverter::convertGemm(node, constantsMap, name_to_input, name_to_initializer);
                 } else if (node.op_type() == "Relu") {
-                    boundedModules.append(BoundedOperationConverter::convertRelu(node));
+                    boundedNode = BoundedOperationConverter::convertRelu(node, name_to_input, name_to_initializer);
                 } else if (node.op_type() == "Reshape") {
-                    boundedModules.append(BoundedOperationConverter::convertReshape(node));
+                    boundedNode = BoundedOperationConverter::convertReshape(node, name_to_input, name_to_initializer);
                 } else {
-                    // Use specific error handling for unsupported operations
                     onnxToTorchUnsupportedOperationError(node);
                 }
+                
+                // Set node metadata
+                boundedNode->setNodeIndex(i);
+                boundedNode->setNodeName(tensorName);
+                
             } catch (const MarabouError& e) {
-                // Re-throw MarabouError exceptions as they are already properly formatted
                 throw;
             } catch (const std::exception& e) {
-                // Convert other exceptions to OnnxToTorch specific errors
                 onnxToTorchBoundedModuleCreationError(node.op_type(), e.what());
             }
             
-            std::cerr << "  Created bounded module at index " << i << " (module index " << boundedModuleIndex << ")" << std::endl << std::flush;
-            boundedModuleIndex++;
+            nodes.append(boundedNode);
             
             if (marabouVarMap.exists(tensorName)) {
                 neuronToMarabouMap[i] = marabouVarMap[tensorName];
@@ -548,43 +562,20 @@ std::shared_ptr<TorchModel> OnnxToTorchParser::processGraph(const Map<String, Ve
             continue;
         }
 
-        // Map Marabou variables for this tensor
-        if (marabouVarMap.exists(tensorName)) {
-            neuronToMarabouMap[i] = marabouVarMap[tensorName];
-            marabouVars[i] = marabouVarMap[tensorName];
-        }
-
         // Track output index
-        if (tensorName == _onnx_model.graph().output(0).name()) {
+        if (_onnx_model.graph().output_size() > 0 && tensorName == _onnx_model.graph().output(0).name()) {
             outputIndex = i;
-            std::cerr << "  Output index set to " << i << std::endl << std::flush;
+            std::cerr << "  Output index set to " << i << " for tensor " << tensorName << std::endl << std::flush;
         }
     }
 
-    // Map input names to their corresponding constants for operations
-    for (const auto& node : _onnx_model.graph().node()) {
-        for (int i = 0; i < node.input_size(); ++i) {
-            String inputName = node.input(i);
-            // If this input name corresponds to a constant, add it to the constants map
-            if (name_to_initializer.exists(inputName) && !constantsMap.exists(inputName)) {
-                torch::Tensor constant = ConstantProcessor::processInitializer(name_to_initializer[inputName]);
-                constantsMap[inputName] = constant;
-            }
-        }
-    }
-
-    return std::make_shared<TorchModel>(
-        boundedModules,
-        constants,
+    return std::make_shared<NLR::TorchModel>(
+        nodes,
         marabouVars,
         inputIndices,
         outputIndex,
         neuronToMarabouMap,
-        dependencies,
-        elementTypes,
-        elementToBoundedModuleIndex,
-        elementToConstantIndex,
-        elementToInputIndex
+        dependencies
     );
 }
 
@@ -888,18 +879,67 @@ torch::Tensor processConstantNode(const onnx::NodeProto& node) {
 
 namespace BoundedOperationConverter {
 
-    std::shared_ptr<NLR::ITorchModuleBounded> convertGemm(const onnx::NodeProto& node, 
-                                                     const Map<String, torch::Tensor>& constants) {
+    // Helper function to extract shape information from ONNX
+    TensorShape extractShapeFromNode(const onnx::NodeProto& node, 
+                                   const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                   const Map<String, onnx::TensorProto>& name_to_initializer,
+                                   const String& tensorName) {
+        (void)node; // Suppress unused parameter warning
+        // Try to get shape from input info
+        if (name_to_input.exists(tensorName)) {
+            const auto& inputInfo = name_to_input[tensorName];
+            if (inputInfo.type().tensor_type().has_shape()) {
+                const auto& shape = inputInfo.type().tensor_type().shape();
+                TensorShape result;
+                for (int i = 0; i < shape.dim_size(); ++i) {
+                    if (shape.dim(i).has_dim_value()) {
+                        result.append(shape.dim(i).dim_value());
+                    }
+                }
+                return result;
+            }
+        }
+        
+        // Try to get shape from initializer
+        if (name_to_initializer.exists(tensorName)) {
+            const auto& initializer = name_to_initializer[tensorName];
+            TensorShape result;
+            for (int i = 0; i < initializer.dims_size(); ++i) {
+                result.append(initializer.dims(i));
+            }
+            return result;
+        }
+        
+        return TensorShape();
+    }
+    
+    // Helper function to compute tensor size from shape
+    unsigned computeTensorSize(const TensorShape& shape) {
+        if (shape.empty()) return 0;
+        
+        unsigned size = 1;
+        for (unsigned dim : shape) {
+            size *= dim;
+        }
+        return size;
+    }
+
+    std::shared_ptr<NLR::BoundedTorchNode> convertGemm(const onnx::NodeProto& node, 
+                                                     const Map<String, torch::Tensor>& constants,
+                                                     const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                     const Map<String, onnx::TensorProto>& name_to_initializer) {
+        (void)name_to_input; // Suppress unused parameter warning
+        (void)name_to_initializer; // Suppress unused parameter warning
         // Extract weights and bias from constants
         if (node.input_size() < 2) {
             onnxToTorchUnexpectedNumberOfInputs(node, node.input_size(), 2, 3);
-            return nullptr; // This line will never be reached, but satisfies compiler
+            return nullptr;
         }
         
         String weightName = node.input(1);
         String biasName = (node.input_size() > 2) ? node.input(2) : "";
         
-        // Try to find weight tensor - check both the input name and common variations
+        // Try to find weight tensor
         torch::Tensor weights;
         bool foundWeights = false;
         
@@ -907,7 +947,6 @@ namespace BoundedOperationConverter {
             weights = constants[weightName];
             foundWeights = true;
         } else {
-            // Try alternative names that might be used
             Vector<String> possibleNames = {weightName, "weight", "W", "weights"};
             for (const auto& name : possibleNames) {
                 if (constants.exists(name)) {
@@ -920,7 +959,7 @@ namespace BoundedOperationConverter {
         
         if (!foundWeights) {
             onnxToTorchInvalidWeightBiasError("Gemm", "Weight tensor not found in constants");
-            return nullptr; // This line will never be reached, but satisfies compiler
+            return nullptr;
         }
         
         // Handle bias tensor
@@ -928,7 +967,6 @@ namespace BoundedOperationConverter {
         if (biasName.length() > 0 && constants.exists(biasName)) {
             bias = constants[biasName];
         } else {
-            // Create zero bias if not found
             bias = torch::zeros({weights.size(0)});
         }
         
@@ -937,54 +975,138 @@ namespace BoundedOperationConverter {
         float beta = AttributeUtils::getFloatAttribute(node, "beta", 1.0f);
         int transB = AttributeUtils::getIntAttribute(node, "transB", 0);
         
-        // ONNX Gemm preprocessing (matches auto_LiRPA _preprocess logic):
-        // Handle transB: if transB == 0 (default), transpose the weight matrix
-        // This matches auto_LiRPA's: "if not self.transB: b = b.transpose(-2, -1)"
+        // ONNX Gemm preprocessing
         if (transB == 0) {
             weights = weights.transpose(-2, -1);
         }
         
-        // Apply beta scaling to bias
         if (beta != 1.0f) {
             bias = beta * bias;
         }
         
-        // Create linear module with preprocessed weights and bias
-        // PyTorch's nn::Linear expects weight to be (out_features, in_features)
-        // After ONNX preprocessing, weights should be in the correct shape
+        // Create linear module
         auto linear_module = torch::nn::Linear(weights.size(1), weights.size(0));
-        linear_module->weight = weights; // Use preprocessed weights directly
-        linear_module->bias = bias;      // Use preprocessed bias
+        linear_module->weight = weights;
+        linear_module->bias = bias;
         
-        // Create bounded module that only needs alpha scaling during forward pass
-        return std::make_shared<NLR::TorchLinearModule>(linear_module, alpha);
+        // Create bounded linear node - sizes will be set automatically in constructor
+        auto boundedNode = std::make_shared<NLR::BoundedLinearNode>(linear_module, alpha);
+        
+        std::cout << "[OnnxToTorch::convertGemm] Created Gemm node with sizes: input=" 
+                  << boundedNode->getInputSize() << ", output=" << boundedNode->getOutputSize() << std::endl;
+        
+        return boundedNode;
     }
     
-    std::shared_ptr<NLR::ITorchModuleBounded> convertRelu(const onnx::NodeProto& node) {
-        (void)node; // Suppress unused parameter warning
-        // Create a bounded ReLU module (you'll need to implement TorchReLUBounded)
+    std::shared_ptr<NLR::BoundedTorchNode> convertRelu(const onnx::NodeProto& node,
+                                                     const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                     const Map<String, onnx::TensorProto>& name_to_initializer) {
+        // Try to infer input size from the input tensor
+        unsigned inputSize = 0;
+        if (node.input_size() > 0) {
+            String inputName = node.input(0);
+            std::cout << "[DEBUG] ReLU input tensor name: " << inputName << std::endl;
+            TensorShape inputShape = extractShapeFromNode(node, name_to_input, name_to_initializer, inputName);
+            std::cout << "[DEBUG] ReLU input shape: ";
+            for (unsigned dim : inputShape) {
+                std::cout << dim << " ";
+            }
+            std::cout << std::endl;
+            inputSize = computeTensorSize(inputShape);
+            std::cout << "[DEBUG] ReLU computed input size: " << inputSize << std::endl;
+        }
+        
         auto relu_module = torch::nn::ReLU(torch::nn::ReLUOptions().inplace(false));
-        return std::make_shared<NLR::TorchReLUBounded>(relu_module);
+        auto boundedNode = std::make_shared<NLR::BoundedReLUNode>(relu_module);
+        
+        // Set sizes if we can infer them
+        if (inputSize > 0) {
+            boundedNode->setInputSize(inputSize);
+            boundedNode->setOutputSize(inputSize); // ReLU preserves input size
+            std::cout << "[OnnxToTorch::convertRelu] Set sizes for ReLU node: input=output=" 
+                      << inputSize << std::endl;
+        }
+        
+        return boundedNode;
     }
     
-    std::shared_ptr<NLR::ITorchModuleBounded> convertIdentity(const onnx::NodeProto& node) {
-        (void)node; // Suppress unused parameter warning
-        // Create a bounded identity module
+    std::shared_ptr<NLR::BoundedTorchNode> convertIdentity(const onnx::NodeProto& node,
+                                                         const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                         const Map<String, onnx::TensorProto>& name_to_initializer) {
+        // Try to infer input size from the input tensor
+        unsigned inputSize = 0;
+        if (node.input_size() > 0) {
+            String inputName = node.input(0);
+            TensorShape inputShape = extractShapeFromNode(node, name_to_input, name_to_initializer, inputName);
+            inputSize = computeTensorSize(inputShape);
+        }
+        
         auto identity_module = torch::nn::Identity();
-        return std::make_shared<NLR::TorchIdentityBounded>(identity_module);
+        auto boundedNode = std::make_shared<NLR::BoundedIdentityNode>(identity_module);
+        
+        // Set sizes if we can infer them
+        if (inputSize > 0) {
+            boundedNode->setInputSize(inputSize);
+            boundedNode->setOutputSize(inputSize); // Identity preserves input size
+            std::cout << "[OnnxToTorch::convertIdentity] Set sizes for Identity node: input=output=" 
+                      << inputSize << std::endl;
+        }
+        
+        return boundedNode;
     }
     
-    std::shared_ptr<NLR::ITorchModuleBounded> convertReshape(const onnx::NodeProto& node) {
-        (void)node; // Suppress unused parameter warning
-        // Create a bounded reshape module
+    std::shared_ptr<NLR::BoundedTorchNode> convertReshape(const onnx::NodeProto& node,
+                                                        const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                        const Map<String, onnx::TensorProto>& name_to_initializer) {
+        // Try to infer sizes from input and output shapes
+        unsigned inputSize = 0;
+        unsigned outputSize = 0;
+        
+        if (node.input_size() > 0) {
+            String inputName = node.input(0);
+            TensorShape inputShape = extractShapeFromNode(node, name_to_input, name_to_initializer, inputName);
+            inputSize = computeTensorSize(inputShape);
+        }
+        
+        if (node.output_size() > 0) {
+            String outputName = node.output(0);
+            TensorShape outputShape = extractShapeFromNode(node, name_to_input, name_to_initializer, outputName);
+            outputSize = computeTensorSize(outputShape);
+        }
+        
         torch::Tensor default_shape = torch::tensor({-1});
-        auto reshape_module = std::make_shared<Operations::ReshapeWrapper>(default_shape);
-        return std::make_shared<NLR::TorchReshapeBounded>(reshape_module);
+        auto reshape_module = Operations::ReshapeWrapper(default_shape);
+        auto boundedNode = std::make_shared<NLR::BoundedReshapeNode>(reshape_module);
+        
+        // Set sizes if we can infer them
+        if (inputSize > 0) {
+            boundedNode->setInputSize(inputSize);
+        }
+        if (outputSize > 0) {
+            boundedNode->setOutputSize(outputSize);
+        }
+        
+        if (inputSize > 0 || outputSize > 0) {
+            std::cout << "[OnnxToTorch::convertReshape] Set sizes for Reshape node: input=" 
+                      << inputSize << ", output=" << outputSize << std::endl;
+        }
+        
+        return boundedNode;
     }
     
-    std::shared_ptr<NLR::ITorchModuleBounded> convertConstant(const torch::Tensor& value) {
-        // Create a bounded constant module
-        return std::make_shared<NLR::TorchConstantBounded>(value);
+    std::shared_ptr<NLR::BoundedTorchNode> convertConstant(const torch::Tensor& value) {
+        auto boundedNode = std::make_shared<NLR::BoundedConstantNode>(value, "");
+        
+        // Set sizes from constant value
+        if (value.defined()) {
+            unsigned size = value.numel();
+            boundedNode->setInputSize(0); // Constants have no input
+            boundedNode->setOutputSize(size);
+            std::cout << "[OnnxToTorch::convertConstant] Set sizes for Constant node: output=" 
+                      << size << std::endl;
+        }
+        
+        return boundedNode;
     }
     
-    } // namespace BoundedOperationConverter
+} // namespace BoundedOperationConverter

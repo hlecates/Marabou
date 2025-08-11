@@ -26,7 +26,9 @@
 #include "onnx.proto3.pb.h"
 
 // Forward declaration
-class TorchModel;
+namespace NLR {
+    class TorchModel;
+}
 
 
 #define ONNX_LOG( x, ... ) MARABOU_LOG( GlobalConfiguration::ONNX_PARSER_LOGGING, "OnnxParser: %s\n", x )
@@ -41,7 +43,7 @@ public:
                        const Set<String> outputNames );
 
     // CHANGES  
-    std::shared_ptr<TorchModel> parseAndReturnTorchModel(
+    std::shared_ptr<NLR::TorchModel> parseAndReturnTorchModel(
                         InputQueryBuilder &query,
                         const String &path,
                         const Set<String> inputNames,

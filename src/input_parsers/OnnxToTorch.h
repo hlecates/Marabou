@@ -8,7 +8,14 @@
 #include "Query.h"
 #include "InputQueryBuilder.h"
 #include "onnx.proto3.pb.h"
-#include "TorchModuleBounded.h"  // Add bounded module include
+#include "BoundedTorchNode.h"  // Add bounded node include
+#include "BoundedConstantNode.h"
+#include "BoundedInputNode.h"
+#include "BoundedLinearNode.h"
+#include "BoundedReLUNode.h"
+#include "BoundedIdentityNode.h"
+#include "BoundedReshapeNode.h"
+#include "Operations.h"
 
 // Undefine Warning macro to avoid conflict with PyTorch
 #ifdef Warning
@@ -19,7 +26,9 @@
 #include <memory>
 
 // Forward declarations
-class TorchModel;
+namespace NLR {
+    class TorchModel;
+}
 
 using TensorShape = Vector<unsigned int>;
 
@@ -54,51 +63,12 @@ void onnxToTorchPyTorchError(const String &operation, const String &pytorchError
 class OnnxToTorchParser
 {
 public:
-    static std::shared_ptr<TorchModel> parse(const String &path, const Map<String, Vector<Variable>>& marabouVarMap);
+    static std::shared_ptr<NLR::TorchModel> parse(const String &path, const Map<String, Vector<Variable>>& marabouVarMap);
 private:
     OnnxToTorchParser(const String &path);
-    std::shared_ptr<TorchModel> processGraph(const Map<String, Vector<Variable>>& marabouVarMap);
+    std::shared_ptr<NLR::TorchModel> processGraph(const Map<String, Vector<Variable>>& marabouVarMap);
     onnx::ModelProto _onnx_model;
 };
-
-
-namespace Operations {
-
-class ReshapeImpl : public torch::nn::Module {
-public:
-    ReshapeImpl() {}
-    torch::Tensor forward(const torch::Tensor& input, const torch::Tensor& shape_tensor);
-};
-TORCH_MODULE(Reshape);
-
-class ReshapeWrapper : public torch::nn::Module {
-private:
-    torch::Tensor shape_tensor;
-public:
-    ReshapeWrapper(torch::Tensor shape) : shape_tensor(shape) {
-        register_buffer("shape", this->shape_tensor);
-    }
-    torch::Tensor forward(const torch::Tensor& input) {
-        // Simple reshape implementation
-        torch::Tensor flattened_shape = shape_tensor.flatten();
-        std::vector<int64_t> new_shape;
-        for (int64_t i = 0; i < flattened_shape.numel(); ++i) {
-            new_shape.push_back(flattened_shape[i].item<int64_t>());
-        }
-        return input.reshape(new_shape);
-    }
-};
-
-class Constant : public torch::nn::Module {
-    torch::Tensor value;
-public:
-    Constant(torch::Tensor value) : value(value) {
-        register_buffer("value", this->value);
-    }
-    torch::Tensor forward();
-};
-
-} // namespace Operations
 
 
 namespace AttributeUtils {
@@ -129,14 +99,29 @@ namespace ConstantProcessor {
     torch::Tensor processConstantNode(const onnx::NodeProto& node);
 }
 
-// New namespace for bounded module conversion
+// New namespace for bounded node conversion
 namespace BoundedOperationConverter {
-    std::shared_ptr<NLR::ITorchModuleBounded> convertGemm(const onnx::NodeProto& node, 
-                                                     const Map<String, torch::Tensor>& constants);
-    std::shared_ptr<NLR::ITorchModuleBounded> convertRelu(const onnx::NodeProto& node);
-    std::shared_ptr<NLR::ITorchModuleBounded> convertIdentity(const onnx::NodeProto& node);
-    std::shared_ptr<NLR::ITorchModuleBounded> convertReshape(const onnx::NodeProto& node);
-    std::shared_ptr<NLR::ITorchModuleBounded> convertConstant(const torch::Tensor& value);
+    // Helper functions for shape extraction
+    TensorShape extractShapeFromNode(const onnx::NodeProto& node, 
+                                   const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                   const Map<String, onnx::TensorProto>& name_to_initializer,
+                                   const String& tensorName);
+    unsigned computeTensorSize(const TensorShape& shape);
+    
+    std::shared_ptr<NLR::BoundedTorchNode> convertGemm(const onnx::NodeProto& node, 
+                                                     const Map<String, torch::Tensor>& constants,
+                                                     const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                     const Map<String, onnx::TensorProto>& name_to_initializer);
+    std::shared_ptr<NLR::BoundedTorchNode> convertRelu(const onnx::NodeProto& node,
+                                                     const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                     const Map<String, onnx::TensorProto>& name_to_initializer);
+    std::shared_ptr<NLR::BoundedTorchNode> convertIdentity(const onnx::NodeProto& node,
+                                                         const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                         const Map<String, onnx::TensorProto>& name_to_initializer);
+    std::shared_ptr<NLR::BoundedTorchNode> convertReshape(const onnx::NodeProto& node,
+                                                        const Map<String, onnx::ValueInfoProto>& name_to_input,
+                                                        const Map<String, onnx::TensorProto>& name_to_initializer);
+    std::shared_ptr<NLR::BoundedTorchNode> convertConstant(const torch::Tensor& value);
 }
 
 #endif // __OnnxToTorchParser_h__

@@ -2,7 +2,7 @@
 #define __CROWNAnalysis_h__
 
 #include "TorchModel.h"
-#include "TorchModuleBounded.h"
+#include "BoundedTorchNode.h"
 #include "BoundedTensor.h"
 #include "Map.h"
 #include "Vector.h"
@@ -20,101 +20,118 @@ public:
     CROWNAnalysis( TorchModel *torchModel );
     ~CROWNAnalysis();
 
+    // Analysis execution
     void run();
+    
+    // Node access
+    std::shared_ptr<BoundedTorchNode> getNode(unsigned index) const;
+    unsigned getInputSize() const;
+    unsigned getOutputSize() const;
+    unsigned getOutputIndex() const;
 
     // Public access methods for testing
-    torch::Tensor getIBPLowerBound(unsigned elementIndex);
-    torch::Tensor getIBPUpperBound(unsigned elementIndex);
-    torch::Tensor getCrownLowerBound(unsigned elementIndex);
-    torch::Tensor getCrownUpperBound(unsigned elementIndex);
-    bool hasIBPBounds(unsigned elementIndex);
-    bool hasCrownBounds(unsigned elementIndex);
-    unsigned getNumElements() const;
+    torch::Tensor getIBPLowerBound(unsigned nodeIndex);
+    torch::Tensor getIBPUpperBound(unsigned nodeIndex);
+    torch::Tensor getCrownLowerBound(unsigned nodeIndex);
+    torch::Tensor getCrownUpperBound(unsigned nodeIndex);
+    bool hasIBPBounds(unsigned nodeIndex);
+    bool hasCrownBounds(unsigned nodeIndex);
+    unsigned getNumNodes() const;
 
     // Concrete bound access methods
-    torch::Tensor getConcreteLowerBound(unsigned elementIndex);
-    torch::Tensor getConcreteUpperBound(unsigned elementIndex);
-    bool hasConcreteBounds(unsigned elementIndex);
+    torch::Tensor getConcreteLowerBound(unsigned nodeIndex);
+    torch::Tensor getConcreteUpperBound(unsigned nodeIndex);
+    bool hasConcreteBounds(unsigned nodeIndex);
+
+    // Output bound access methods
+    BoundedTensor<torch::Tensor> getOutputBounds() const;
+    BoundedTensor<torch::Tensor> getOutputIBPBounds() const;
+
+    // Model access for testing 
+    TorchModel* getModel() const { return _torchModel; }
+
+    // Additional public methods for testing
+    Vector<BoundedTensor<torch::Tensor>> getInputBoundsForNode(unsigned nodeIndex);
+
+    // Processing state
+    void resetProcessingState();
+    void markProcessed(unsigned nodeIndex);
+    bool isProcessed(unsigned nodeIndex) const;
+
+
+    void computeIBPBounds();
+    void computeCrownBackwardPropagation();
+    void concretizeBounds();
+
+    // Compute the forward pass vlaues via the torch model for concretizing the bounds
+    void computeForwardPassValues();
+
+    // Updated concrete bound method signatures
+    torch::Tensor computeConcreteLowerBound(const torch::Tensor& lA, const torch::Tensor& lBias,
+                                           const torch::Tensor& xLower, const torch::Tensor& xUpper);
+    torch::Tensor computeConcreteUpperBound(const torch::Tensor& uA, const torch::Tensor& uBias,
+                                           const torch::Tensor& xLower, const torch::Tensor& xUpper);
+
+
+    void setInputBounds(const BoundedTensor<torch::Tensor>& inputBounds);
+    BoundedTensor<torch::Tensor> getNodeIBPBounds(unsigned nodeIndex) const;
+    BoundedTensor<torch::Tensor> getNodeCrownBounds(unsigned nodeIndex) const;
+    BoundedTensor<torch::Tensor> getNodeConcreteBounds(unsigned nodeIndex) const;
+
+    // Helper functions for A matrix accumulation (following auto-LiRPA's approach)
+    torch::Tensor addA(const torch::Tensor& A1, const torch::Tensor& A2);
+    void addBound(unsigned nodeIndex, const torch::Tensor& lA, const torch::Tensor& uA);
+    void addBias(unsigned nodeIndex, const torch::Tensor& lBias, const torch::Tensor& uBias);
 
 private:
     TorchModel *_torchModel;
 
-    // Graph structure following auto-LiRPA's approach
-    Map<unsigned, std::shared_ptr<ITorchModuleBounded>> _boundedElements;
-    Map<unsigned, Vector<unsigned>> _dependencies;  // layer -> input layers
-    Map<unsigned, Vector<unsigned>> _dependents;    // layer -> output layers
-    Map<unsigned, unsigned> _degreeIn;              // in-degree
-    Map<unsigned, unsigned> _degreeOut;             // out-degree
-    Map<unsigned, bool> _processed;                 // track processed nodes
+    // Node-centric graph structure (delegated to TorchModel)
+    // ie all graph management is done by torch model
+    Map<unsigned, std::shared_ptr<BoundedTorchNode>> _nodes;
     
     // A matrix storage following auto-LiRPA's approach
     Map<unsigned, torch::Tensor> _lA;  // lower bound A matrices
     Map<unsigned, torch::Tensor> _uA;  // upper bound A matrices
-    
-    // Working memory
-    torch::Tensor *_workLowerBounds;
-    torch::Tensor *_workUpperBounds;
-    torch::Tensor *_workLinearWeights;
-    torch::Tensor *_workLinearBias;
-
-    // Bound computation state
-    Map<unsigned, torch::Tensor> _lowerBounds;
-    Map<unsigned, torch::Tensor> _upperBounds;
-    Map<unsigned, std::pair<torch::Tensor, torch::Tensor>> _ibpBounds;
-    Map<unsigned, NLR::LinearBound> _linearBounds;
 
     // Bias accumulation following auto-LiRPA's approach
-    torch::Tensor _lowerBias;
-    torch::Tensor _upperBias;
+    // The following were global bias accumulation, since we need bounds on every nueron, need the bias for each nodes individual scope
+    // torch::Tensor _lowerBias;
+    // torch::Tensor _upperBias;
+    Map<unsigned, torch::Tensor> _lowerBias;
+    Map<unsigned, torch::Tensor> _upperBias;
+
+    Map<unsigned, BoundedTensor<torch::Tensor>> _ibpBounds;
 
     // Concrete Bounds 
-    Map<unsigned, std::pair<torch::Tensor, torch::Tensor>> _concreteBounds;
+    Map<unsigned, BoundedTensor<torch::Tensor>> _concreteBounds;
 
-    // Helper methods
-    Vector<BoundedTensor<torch::Tensor>> getInputBoundsForElement(unsigned elementIndex);
-    Map<unsigned, std::pair<torch::Tensor, torch::Tensor>> _inputBounds;
-
-    // Graph construction and traversal methods
-    void buildDependencyGraph();
-    Vector<unsigned> topologicalSort();
-
-    // Processing State management
-    void resetProcessingState();
-    bool isProcessed(unsigned elementIndex) const;
-    void markProcessed(unsigned elementIndex);
-    
-    // Memory management
-    void allocateMemory();
-    void freeMemoryIfNeeded();
-
-    // Bound computation methods
-    void computeIBPBounds();
-    void computeCrownBackwardPropagation();
+    // Forward value for concretizing bounds
+    Map<unsigned, torch::Tensor> _forwardPassValues;
 
     // Concretize Bounds
-    void concretizeBounds();
-    torch::Tensor computeConcreteLowerBound(const torch::Tensor& lA, const torch::Tensor& lBias,
-                                           const torch::Tensor& center, const torch::Tensor& eps);
-    torch::Tensor computeConcreteUpperBound(const torch::Tensor& uA, const torch::Tensor& uBias,
-                                           const torch::Tensor& center, const torch::Tensor& eps);
     void computeConcreteBounds(const torch::Tensor& lA, const torch::Tensor& uA,
                               const torch::Tensor& lBias, const torch::Tensor& uBias,
-                              const torch::Tensor& center, const torch::Tensor& eps,
+                              const torch::Tensor& nodeLower, const torch::Tensor& nodeUpper,
                               torch::Tensor& concreteLower, torch::Tensor& concreteUpper);
-
 
     // Utility methods
     void log( const String &message );
+    std::string nodeTypeToString(NodeType type) {
+        switch (type) {
+            case NodeType::INPUT: return "INPUT";
+            case NodeType::CONSTANT: return "CONSTANT";
+            case NodeType::LINEAR: return "LINEAR";
+            case NodeType::RELU: return "RELU";
+            case NodeType::RESHAPE: return "RESHAPE";
+            case NodeType::IDENTITY: return "IDENTITY";
+            default: return "UNKNOWN";
+        }
+    }
 
-    // Helper functions for A matrix accumulation (following auto-LiRPA's approach)
-    torch::Tensor addA(const torch::Tensor& A1, const torch::Tensor& A2);
-    void addBound(unsigned elementIndex, const torch::Tensor& lA, const torch::Tensor& uA);
-    
     // Helper function for establishing consistent tensor format
     torch::Tensor preprocessC(const torch::Tensor& C, unsigned outputSize);
-    
-    // Helper method to get output index
-    unsigned getOutputIndex() const;
+
 };
 
 } // namespace NLR

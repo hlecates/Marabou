@@ -1,0 +1,65 @@
+#ifndef __BOUNDED_RESHAPE_NODE_H__
+#define __BOUNDED_RESHAPE_NODE_H__
+
+#include "BoundedTorchNode.h"
+#include "../input_parsers/Operations.h"
+
+namespace NLR {
+
+class BoundedReshapeNode : public BoundedTorchNode {
+public:
+    BoundedReshapeNode(const Operations::ReshapeWrapper& reshape_module);
+    
+    // Node identification
+    NLR::NodeType getNodeType() const override { return NLR::NodeType::RESHAPE; }
+    String getNodeName() const override { return _nodeName; }
+    unsigned getNodeIndex() const override { return _nodeIndex; }
+    
+    // Standard PyTorch forward pass
+    torch::Tensor forward(const torch::Tensor& input) override;
+    
+    // CROWN Backward Mode
+    Pair<torch::Tensor, torch::Tensor> computeCrownBackwardPropagation(const torch::Tensor& lastLowerAlpha, 
+                                               const torch::Tensor& lastUpperAlpha,
+                                               const Vector<BoundedTensor<torch::Tensor>>& inputs);
+    
+    // IBP
+    BoundedTensor<torch::Tensor> computeIntervalBoundPropagation(
+        const Vector<BoundedTensor<torch::Tensor>>& inputs) override;
+    
+    // Auto-LiRPA style boundBackward method (NEW)
+    // Returns: A matrices for inputs, lower bias, upper bias
+    void boundBackward(
+        const torch::Tensor& last_lA, 
+        const torch::Tensor& last_uA,
+        const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
+        Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+        torch::Tensor& lbias,
+        torch::Tensor& ubias
+    ) override;
+    
+    // Module information
+    unsigned getInputSize() const override { return _input_size; }
+    unsigned getOutputSize() const override { return _output_size; }
+    bool isPerturbed() const override { return true; }
+    String getModuleType() const { return "Reshape"; }
+    
+    // Size setters for initialization
+    void setInputSize(unsigned size) override;
+    void setOutputSize(unsigned size) override;
+    
+    // Variable mapping
+    void setNeuronToMarabouMap(const Map<unsigned, Vector<Variable>>& neuronMapping) override;
+    const Map<unsigned, Vector<Variable>>& getNeuronToMarabouMap() const override;
+    
+    // Node state
+    void setNodeIndex(unsigned index) override { _nodeIndex = index; }
+    void setNodeName(const String& name) override { _nodeName = name; }
+
+private:
+    Operations::ReshapeWrapper _reshape_module;
+};
+
+} // namespace NLR
+
+#endif // __BOUNDED_RESHAPE_NODE_H__ 

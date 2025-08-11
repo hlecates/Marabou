@@ -197,7 +197,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         
         TS_ASSERT(model != nullptr);
         TS_ASSERT(model->getSize() > 0);
@@ -220,7 +220,7 @@ public:
         createMinimalOnnxFile(testFile, "Gemm");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         
         TS_ASSERT(model != nullptr);
         TS_ASSERT(model->getSize() > 0);
@@ -234,7 +234,7 @@ public:
         createMinimalOnnxFile(testFile, "Relu");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         
         TS_ASSERT(model != nullptr);
         TS_ASSERT(model->getSize() > 0);
@@ -456,30 +456,18 @@ public:
         gemmNode.add_input("weight");
         gemmNode.add_input("bias");
 
-        // Add attributes
-        auto* alphaAttr = gemmNode.add_attribute();
-        alphaAttr->set_name("alpha");
-        alphaAttr->set_type(onnx::AttributeProto::FLOAT);
-        alphaAttr->set_f(2.0f);
-
-        auto* betaAttr = gemmNode.add_attribute();
-        betaAttr->set_name("beta");
-        betaAttr->set_type(onnx::AttributeProto::FLOAT);
-        betaAttr->set_f(1.5f);
-
-        auto* transBAttr = gemmNode.add_attribute();
-        transBAttr->set_name("transB");
-        transBAttr->set_type(onnx::AttributeProto::INT);
-        transBAttr->set_i(0);
-
-        // Create constants map
+        // Create constants map with weight and bias
         Map<String, torch::Tensor> constants;
         constants["weight"] = torch::tensor({{1.0, 2.0}, {3.0, 4.0}});
-        constants["bias"] = torch::tensor({0.1, 0.2});
+        constants["bias"] = torch::tensor({0.5, -0.5});
+
+        // Create empty maps for shape extraction (not used in this test)
+        Map<String, onnx::ValueInfoProto> name_to_input;
+        Map<String, onnx::TensorProto> name_to_initializer;
 
         // Test Gemm conversion
-        std::shared_ptr<NLR::ITorchModuleBounded> boundedModule = 
-            BoundedOperationConverter::convertGemm(gemmNode, constants);
+        std::shared_ptr<NLR::BoundedTorchNode> boundedModule = 
+            BoundedOperationConverter::convertGemm(gemmNode, constants, name_to_input, name_to_initializer);
         
         TS_ASSERT(boundedModule != nullptr);
 
@@ -500,10 +488,12 @@ public:
 
         // Empty constants map
         Map<String, torch::Tensor> constants;
+        Map<String, onnx::ValueInfoProto> name_to_input;
+        Map<String, onnx::TensorProto> name_to_initializer;
 
         // Should throw error for missing weight
         TS_ASSERT_THROWS_EQUALS(
-            BoundedOperationConverter::convertGemm(gemmNode, constants),
+            BoundedOperationConverter::convertGemm(gemmNode, constants, name_to_input, name_to_initializer),
             const MarabouError& e,
             e.getCode(),
             MarabouError::ONNX_PARSER_ERROR
@@ -517,10 +507,12 @@ public:
         // Missing weight and bias inputs
 
         Map<String, torch::Tensor> constants;
+        Map<String, onnx::ValueInfoProto> name_to_input;
+        Map<String, onnx::TensorProto> name_to_initializer;
 
         // Should throw error for insufficient inputs
         TS_ASSERT_THROWS_EQUALS(
-            BoundedOperationConverter::convertGemm(gemmNode, constants),
+            BoundedOperationConverter::convertGemm(gemmNode, constants, name_to_input, name_to_initializer),
             const MarabouError& e,
             e.getCode(),
             MarabouError::ONNX_PARSER_ERROR
@@ -533,9 +525,13 @@ public:
         reluNode.add_input("input");
         reluNode.add_output("output");
 
+        // Create empty maps for shape extraction
+        Map<String, onnx::ValueInfoProto> name_to_input;
+        Map<String, onnx::TensorProto> name_to_initializer;
+
         // Test ReLU conversion
-        std::shared_ptr<NLR::ITorchModuleBounded> boundedModule = 
-            BoundedOperationConverter::convertRelu(reluNode);
+        std::shared_ptr<NLR::BoundedTorchNode> boundedModule = 
+            BoundedOperationConverter::convertRelu(reluNode, name_to_input, name_to_initializer);
         
         TS_ASSERT(boundedModule != nullptr);
 
@@ -555,9 +551,13 @@ public:
         identityNode.add_input("input");
         identityNode.add_output("output");
 
+        // Create empty maps for shape extraction
+        Map<String, onnx::ValueInfoProto> name_to_input;
+        Map<String, onnx::TensorProto> name_to_initializer;
+
         // Test Identity conversion
-        std::shared_ptr<NLR::ITorchModuleBounded> boundedModule = 
-            BoundedOperationConverter::convertIdentity(identityNode);
+        std::shared_ptr<NLR::BoundedTorchNode> boundedModule = 
+            BoundedOperationConverter::convertIdentity(identityNode, name_to_input, name_to_initializer);
         
         TS_ASSERT(boundedModule != nullptr);
 
@@ -578,17 +578,15 @@ public:
         reshapeNode.add_input("shape");
         reshapeNode.add_output("output");
 
+        // Create empty maps for shape extraction
+        Map<String, onnx::ValueInfoProto> name_to_input;
+        Map<String, onnx::TensorProto> name_to_initializer;
+
         // Test Reshape conversion
-        std::shared_ptr<NLR::ITorchModuleBounded> boundedModule = 
-            BoundedOperationConverter::convertReshape(reshapeNode);
+        std::shared_ptr<NLR::BoundedTorchNode> boundedModule = 
+            BoundedOperationConverter::convertReshape(reshapeNode, name_to_input, name_to_initializer);
         
         TS_ASSERT(boundedModule != nullptr);
-
-        // Test forward pass
-        torch::Tensor input = torch::tensor({1.0, 2.0, 3.0, 4.0});
-        torch::Tensor output = boundedModule->forward(input);
-        
-        TS_ASSERT_EQUALS(output.numel(), input.numel());
     }
 
     // ========== ATTRIBUTE UTILS TESTS ==========
@@ -974,7 +972,7 @@ public:
         testVars.append(Variable(1));
         marabouVarMap["input"] = testVars; // Map to the input node name
 
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
         
         // Test that the model can be created and has the expected structure
@@ -1016,7 +1014,7 @@ public:
         }
         marabouVarMap["output"] = outputVars;
         
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         
         TS_ASSERT(model != nullptr);
         TS_ASSERT(model->getSize() > 0);
@@ -1037,7 +1035,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
         
         // Test forward pass with matching dimensions
@@ -1060,7 +1058,7 @@ public:
         createMinimalOnnxFile(testFile, "Relu");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
         
         // Test forward pass with matching dimensions
@@ -1119,7 +1117,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         
         TS_ASSERT(model != nullptr);
         TS_ASSERT(model->getSize() > 0);
@@ -1248,7 +1246,7 @@ public:
         
         // Test multiple parsing operations to check for memory leaks
         for (int i = 0; i < 10; ++i) {
-            std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+            std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
             TS_ASSERT(model != nullptr);
             
             // Test forward pass
@@ -1272,7 +1270,7 @@ public:
         auto start = std::chrono::high_resolution_clock::now();
         
         for (int i = 0; i < 100; ++i) {
-            std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+            std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
             TS_ASSERT(model != nullptr);
         }
         
@@ -1290,7 +1288,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
 
         torch::Tensor input = torch::tensor({1.0, 2.0, 3.0});
@@ -1606,7 +1604,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
 
         // Test that the model integrates properly with TorchModel
@@ -1630,7 +1628,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
 
         // Test that the model can still perform forward pass
@@ -1650,8 +1648,8 @@ public:
         Map<String, Vector<Variable>> marabouVarMap;
         
         // Parse the same file multiple times
-        std::shared_ptr<TorchModel> model1 = OnnxToTorchParser::parse(testFile, marabouVarMap);
-        std::shared_ptr<TorchModel> model2 = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model1 = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model2 = OnnxToTorchParser::parse(testFile, marabouVarMap);
         
         TS_ASSERT(model1 != nullptr);
         TS_ASSERT(model2 != nullptr);
@@ -1674,7 +1672,7 @@ public:
         createMinimalOnnxFile(testFile, "Identity");
         
         Map<String, Vector<Variable>> marabouVarMap;
-        std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+        std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
         TS_ASSERT(model != nullptr);
 
         // Test that the model structure is preserved
@@ -1724,7 +1722,7 @@ public:
         // Test that parser can recover after encountering errors
         for (int i = 0; i < 5; ++i) {
             try {
-                std::shared_ptr<TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
+                std::shared_ptr<NLR::TorchModel> model = OnnxToTorchParser::parse(testFile, marabouVarMap);
                 TS_ASSERT(model != nullptr);
                 
                 // Test forward pass

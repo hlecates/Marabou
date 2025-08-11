@@ -1,3 +1,7 @@
+// goal is to have
+// CROWN Analysis ←→ TorchModel ←→ NLR/Engine
+// Such that the torch model acts as a torch "delegator"/"convertor"
+
 #ifndef __TorchModel_h__
 #define __TorchModel_h__
 
@@ -7,7 +11,20 @@
 #include "Vector.h"
 #include "Query.h"
 #include "InputQueryBuilder.h"
-#include "TorchModuleBounded.h"
+#include "BoundedTorchNode.h"
+#include "BoundedInputNode.h"
+#include "BoundedLinearNode.h"
+#include "BoundedReLUNode.h"
+#include "BoundedIdentityNode.h"
+#include "BoundedConstantNode.h"
+#include "BoundedReshapeNode.h"
+#include "Tightening.h"
+#include "List.h"
+#include "ITableau.h"
+#include "LayerOwner.h"
+
+// Forward declaration to avoid circular dependency
+class CROWNAnalysis;
 
 // Undefine Warning macro to avoid conflict with PyTorch
 #ifdef Warning
@@ -17,94 +34,124 @@
 #include <torch/torch.h>
 #include <memory>
 
-// Enum for element types
-enum class ElementType { MODULE, CONSTANT, INPUT };
+namespace NLR {
 
-class TorchModel : public torch::nn::Module {
+class TorchModel {
 public:
-    TorchModel(
-        const Vector<std::shared_ptr<NLR::ITorchModuleBounded>>& boundedModules,
-        const Vector<torch::Tensor>& constants,
-        const Vector<Vector<Variable>>& marabouVars,
-        const Vector<unsigned>& inputIndices,
-        unsigned outputIndex,
-        const Map<unsigned, Vector<Variable>>& neuronToMarabouMap,
-        const Map<unsigned, Vector<unsigned>>& dependencies,
-        const Map<unsigned, ElementType>& elementTypes,
-        const Map<unsigned, unsigned>& elementToBoundedModuleIndex,
-        const Map<unsigned, unsigned>& elementToConstantIndex,
-        const Map<unsigned, unsigned>& elementToInputIndex
-    );
+    TorchModel(const Vector<std::shared_ptr<BoundedTorchNode>>& nodes, 
+               const Vector<Vector<Variable>>& marabouVars,
+               const Vector<unsigned>& inputIndices,
+               unsigned outputIndex,
+               const Map<unsigned, Vector<Variable>>& neuronToMarabouMap,
+               const Map<unsigned, Vector<unsigned>>& dependencies);
+    
+    // Forward pass through the entire model
+    torch::Tensor forward(const torch::Tensor& input);
+    torch::Tensor forward(unsigned nodeIndex, Map<unsigned, torch::Tensor>& activations, 
+                         const Map<unsigned, torch::Tensor>& inputs);
 
-    // Forward pass methods
-    torch::Tensor forward(const Map<unsigned, torch::Tensor>& inputs);
-    torch::Tensor forward(torch::Tensor input); // Legacy 
+    
+    
+    // forward pass that returns activations for all nodes
+    Map<unsigned, torch::Tensor> forwardAndStoreActivations(const torch::Tensor& input);
+    Map<unsigned, torch::Tensor> forwardAndStoreActivations(const Map<unsigned, torch::Tensor>& inputs);            
 
-    // Getters for model information
-    const Vector<std::shared_ptr<NLR::ITorchModuleBounded>>& getBoundedModules() const { return _boundedModules; }
-    const Vector<Vector<Variable>>& getVariables() const { return _marabouVars; }
+    // Get model information
+    unsigned getInputSize() const { return _input_size; }
+    unsigned getOutputSize() const { return _output_size; }
+    unsigned getNumNodes() const { return _nodes.size(); }
+    
+    // Access to nodes
+    const Vector<std::shared_ptr<BoundedTorchNode>>& getNodes() const { return _nodes; }
+    std::shared_ptr<BoundedTorchNode> getNode(unsigned index) const;
+    Vector<unsigned> getAllNodeIndices() const;
+    Vector<unsigned> getNodesByType(NodeType type) const;
     const Vector<unsigned>& getInputIndices() const { return _inputIndices; }
     unsigned getOutputIndex() const { return _outputIndex; }
-    unsigned getSize() const { return _boundedModules.size(); }
+    
+    // PRIMARY BOUND MANAGEMENT INTERFACE
+    void setInputBounds(const BoundedTensor<torch::Tensor>& inputBounds);
+    
+    // CONCRETE BOUND STORAGE (for CROWN analysis to call)
+    void setConcreteBounds(unsigned nodeIndex, const BoundedTensor<torch::Tensor>& concreteBounds);
+    // FOR TESTING AND OUTPUTTING
+    BoundedTensor<torch::Tensor> getConcreteBounds(unsigned nodeIndex) const;
+    bool hasConcreteBounds(unsigned nodeIndex) const;
+    
+    // Input bound access
+    BoundedTensor<torch::Tensor> getInputBounds() const;
+    bool hasInputBounds() const;
+    torch::Tensor getInputLowerBounds() const;
+    torch::Tensor getInputUpperBounds() const;
+    
+    // NLR/ENGINE COMMUNICATION INTERFACE (for future Marabou integration)
+    // void setModelOwner(LayerOwner* layerOwner) { _modelOwner = layerOwner; }
+    // LayerOwner* getModelOwner() const { return _modelOwner; }
+    
+    // NLR BOUND MANAGEMENT
+    // void obtainCurrentBoundsFromNLR();
+    // void updateNLRWithTighterBounds();
+    
+    // BOUND COMPARISON AND COMMUNICATION
+    // void communicateTighterBound(unsigned nodeIndex, unsigned neuronIndex, double bound, Tightening::BoundType type);
+    // bool hasTighterBounds() const;
+    
+    // Variable mapping - simplified to just store the passed maps
+    const Vector<Vector<Variable>>& getVariables() const { return _marabouVars; }
     const Map<unsigned, Vector<Variable>>& getNeuronToMarabouMap() const { return _neuronToMarabouMap; }
-    const Map<unsigned, Vector<unsigned>>& getDependencies() const { return _dependencies; }
+    const Map<unsigned, Vector<unsigned>>& getDependenciesMap() const { return _dependencies; }
 
-    // Bound computation methods
-    void computeBounds(const Map<unsigned, std::pair<torch::Tensor, torch::Tensor>>& inputBounds);
-    std::pair<torch::Tensor, torch::Tensor> getOutputBounds() const;
-    NLR::LinearBound getLinearBounds(unsigned elementIndex) const;
-    
-    // Variable elimination and reindexing
-    void eliminateVariable(unsigned variable, double value);
-    void updateVariableIndices(const Map<unsigned, unsigned>& oldIndexToNewIndex,
-                              const Map<unsigned, unsigned>& mergedVariables);
-    bool neuronEliminated(unsigned neuron) const;
-    double getEliminatedNeuronValue(unsigned neuron) const;
-    void reduceIndexFromAllMaps(unsigned startIndex);
-    void adjustMapIndexing(Map<unsigned, Vector<Variable>>& map, unsigned startIndex);
+    // Full graph 
+    void buildDependencyGraph();
+    void buildDependents();
+    void computeDegrees();
 
-    // Add setter for input bounds
-    void setInputBounds(const Map<unsigned, std::pair<torch::Tensor, torch::Tensor>>& inputBounds) {
-        _inputBounds = inputBounds;
-    }
-    
-    // Getter for input bounds
-    const Map<unsigned, std::pair<torch::Tensor, torch::Tensor>>& getInputBounds() const {
-        return _inputBounds;
-    }
-    
-    // Getter for element to bounded module index mapping
-    const Map<unsigned, unsigned>& getElementToBoundedModuleIndex() const {
-        return _elementToBoundedModuleIndex;
-    }
+    // Traversal 
+    Vector<unsigned> topologicalSort() const;
+    Vector<unsigned> getRoots() const;
+    Vector<unsigned> getLeaves() const;
+    Vector<unsigned> getDependents(unsigned nodeIndex) const;
+    Vector<unsigned> getDependencies(unsigned nodeIndex) const;
+
+    // Degree and Processing states
+    unsigned getDegreeOut(unsigned nodeIndex) const;
+    unsigned getDegreeIn(unsigned nodeIndex) const;
+    void resetProcessingState();
+    bool isProcessed(unsigned nodeIndex) const;
+    void markProcessed(unsigned nodeIndex);
+
+    // Logging
+    void log(const String& message) const;
 
 private:
-    // Core model components - only bounded modules
-    Vector<std::shared_ptr<NLR::ITorchModuleBounded>> _boundedModules;
-    Vector<torch::Tensor> _constants;
+    Vector<std::shared_ptr<BoundedTorchNode>> _nodes;
     Vector<Vector<Variable>> _marabouVars;
     Vector<unsigned> _inputIndices;
     unsigned _outputIndex;
     Map<unsigned, Vector<Variable>> _neuronToMarabouMap;
     Map<unsigned, Vector<unsigned>> _dependencies;
     
-    // Mapping system for type safety
-    Map<unsigned, ElementType> _elementTypes;
-    Map<unsigned, unsigned> _elementToBoundedModuleIndex;
-    Map<unsigned, unsigned> _elementToConstantIndex;
-    Map<unsigned, unsigned> _elementToInputIndex;
+    // Graph traversal state
+    Map<unsigned, Vector<unsigned>> _dependents;
+    Map<unsigned, unsigned> _degreeOut;
+    Map<unsigned, unsigned> _degreeIn;
+    Map<unsigned, bool> _processed;
     
-    // Track eliminated neurons and their values
-    Map<unsigned, double> _eliminatedNeurons;
-
-    // Bound computation state
-    Map<unsigned, torch::Tensor> _lowerBounds;
-    Map<unsigned, torch::Tensor> _upperBounds;
-    Map<unsigned, NLR::LinearBound> _linearBounds;
-    Map<unsigned, std::pair<torch::Tensor, torch::Tensor>> _inputBounds;
-
-    // Helper method for recursive forward pass
-    torch::Tensor forward(unsigned elementIndex, Map<unsigned, torch::Tensor>& activations, const Map<unsigned, torch::Tensor>& inputs);
+    // Model dimensions
+    unsigned _input_size;
+    unsigned _output_size;
+    
+    // NLR COMMUNICATION
+    // LayerOwner* _modelOwner;
+    
+    BoundedTensor<torch::Tensor> _inputBounds;      // Input bounds for the model
+    Map<unsigned, BoundedTensor<torch::Tensor>> _concreteBounds;  // CROWN concrete bounds
+    // Map<unsigned, BoundedTensor<torch::Tensor>> _nlrBounds;       // NLR bounds for comparison
+    
+    // error checking
+    void validateNodeIndex(unsigned nodeIndex) const;
 };
+
+} // namespace NLR
 
 #endif // __TorchModel_h__ 
