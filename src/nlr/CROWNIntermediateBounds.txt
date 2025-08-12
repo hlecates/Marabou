@@ -1,0 +1,323 @@
+CROWNAnalysis::CROWNAnalysis( TorchModel *torchModel, bool useStandardCROWN )
+    : _torchModel( torchModel )
+{
+    _useStandardCROWN = useStandardCROWN;
+    // Get all nodes from the torch model
+    const Vector<std::shared_ptr<BoundedTorchNode>>& nodes = _torchModel->getNodes();
+    
+    // Initialize nodes map -> map network node indices to bounded nodes
+    for ( unsigned i = 0; i < nodes.size(); ++i ) 
+    {
+        _nodes[i] = nodes[i];
+    }
+}
+
+void CROWNAnalysis::run()
+{
+    log("run() - Starting");
+    try {
+        if (_useStandardCROWN) {
+            // Standard CROWN: compute intermediate bounds via CROWN layer-by-layer
+            Vector<unsigned> forwardOrder = _torchModel->topologicalSort();
+            for (unsigned nodeIndex : forwardOrder) {
+                if (_nodes[nodeIndex]->getNodeType() == NodeType::INPUT) continue;
+                backwardFrom(nodeIndex);
+                concretizeNode(nodeIndex);
+            }
+        } else {
+            // CROWN-IBP: IBP for intermediates, CROWN for final
+            computeIBPBounds();
+            backwardFrom(getOutputIndex());
+            concretizeNode(getOutputIndex());
+        }
+    } catch (const std::exception& e) {
+        log(Stringf("run() - Exception caught: %s", e.what()));
+        throw;
+    }
+    log("run() - Completed");
+}
+
+void CROWNAnalysis::backwardFrom(unsigned startIndex)
+{
+    if ( !_nodes.exists(startIndex) ) {
+        log(Stringf("backwardFrom() - Warning: start index %u not found in nodes.", startIndex));
+        return;
+    }
+
+    // Fresh state for this run
+    clearCrownState();
+
+    // Initialize with identity matrices for the start node
+    auto& startNode = _nodes[startIndex];
+    unsigned startSize = startNode->getOutputSize();
+
+    torch::Tensor identityMatrix = preprocessC(torch::Tensor(), startSize);
+    _lA[startIndex] = identityMatrix;
+    _uA[startIndex] = identityMatrix;
+
+    _lowerBias[startIndex] = torch::zeros({startSize}, torch::kFloat32);
+    _upperBias[startIndex] = torch::zeros({startSize}, torch::kFloat32);
+
+    resetProcessingState();
+
+    log(Stringf("backwardFrom() - Starting queue processing from node %u", startIndex));
+
+    Queue<unsigned> queue;
+    queue.push(startIndex);
+
+    while (!queue.empty())
+    {
+        unsigned current = queue.peak();
+        queue.pop();
+
+        if ( isProcessed(current) ) continue;
+        markProcessed(current);
+
+        auto& node = _nodes[current];
+        NodeType nodetype = node->getNodeType();
+
+        if (!_lA.exists(current) && !_uA.exists(current)) {
+            log(Stringf("No A matrices for node %u, skipping", current));
+            continue;
+        }
+
+        // Bounds for current's inputs: IBP or CROWN-concrete depending on mode and availability
+        Vector<BoundedTensor<torch::Tensor>> inputBounds = getInputBoundsForNode(current);
+
+        torch::Tensor currentLowerAlpha = _lA.exists(current) ? _lA[current] : torch::Tensor();
+        torch::Tensor currentUpperAlpha = _uA.exists(current) ? _uA[current] : torch::Tensor();
+
+        Vector<Pair<torch::Tensor, torch::Tensor>> A_matrices;
+        torch::Tensor lbias, ubias;
+        node->boundBackward(currentLowerAlpha, currentUpperAlpha, inputBounds, A_matrices, lbias, ubias);
+
+        if (_torchModel->getDependenciesMap().exists(current))
+        {
+            for (unsigned i = 0; i < _torchModel->getDependencies(current).size() && i < A_matrices.size(); ++i)
+            {
+                unsigned inputIndex = _torchModel->getDependencies(current)[i];
+
+                torch::Tensor new_lA = A_matrices[i].first();
+                torch::Tensor new_uA = A_matrices[i].second();
+
+                addBound(inputIndex, new_lA, new_uA);
+
+                torch::Tensor propagated_lbias = lbias.defined() ? lbias.clone() : torch::zeros_like(_lowerBias[current]);
+                torch::Tensor propagated_ubias = ubias.defined() ? ubias.clone() : torch::zeros_like(_upperBias[current]);
+
+                if (_lowerBias.exists(current)) propagated_lbias = propagated_lbias + _lowerBias[current];
+                if (_upperBias.exists(current)) propagated_ubias = propagated_ubias + _upperBias[current];
+
+                addBias(inputIndex, propagated_lbias, propagated_ubias);
+
+                queue.push(inputIndex);
+            }
+        }
+
+        if (nodetype != NodeType::INPUT) {
+            _lA.erase(current);
+            _uA.erase(current);
+            _lowerBias.erase(current);
+            _upperBias.erase(current);
+        }
+    }
+    log("backwardFrom() - Completed.");
+}
+
+void CROWNAnalysis::clearCrownState()
+{
+    _lA.clear();
+    _uA.clear();
+    _lowerBias.clear();
+    _upperBias.clear();
+}
+
+void CROWNAnalysis::concretizeNode(unsigned startIndex)
+{
+    // Determine input node index
+    int inputIndex = -1;
+    for (const auto &p : _nodes) {
+        if (p.second->getNodeType() == NodeType::INPUT) {
+            inputIndex = static_cast<int>(p.first);
+            break;
+        }
+    }
+    if (inputIndex < 0) {
+        if (_ibpBounds.exists(startIndex)) {
+            _concreteBounds[startIndex] = _ibpBounds[startIndex];
+            _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+        }
+        return;
+    }
+
+    // Get input bounds
+    torch::Tensor inputLower, inputUpper;
+    if (_torchModel->hasInputBounds()) {
+        inputLower = _torchModel->getInputLowerBounds();
+        inputUpper = _torchModel->getInputUpperBounds();
+    } else {
+        unsigned inputSize = _torchModel->getInputSize();
+        inputLower = torch::zeros({(long)inputSize}, torch::kFloat32);
+        inputUpper = torch::ones({(long)inputSize}, torch::kFloat32);
+    }
+    inputLower = inputLower.to(torch::kFloat32);
+    inputUpper = inputUpper.to(torch::kFloat32);
+
+    // Retrieve A and bias at input node (w.r.t. this start node)
+    if (!_lA.exists(inputIndex) && !_uA.exists(inputIndex)) {
+        if (_ibpBounds.exists(startIndex)) {
+            _concreteBounds[startIndex] = _ibpBounds[startIndex];
+            _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+        }
+        return;
+    }
+    torch::Tensor lA = _lA.exists(inputIndex) ? _lA[inputIndex] : torch::Tensor();
+    torch::Tensor uA = _uA.exists(inputIndex) ? _uA[inputIndex] : torch::Tensor();
+    torch::Tensor lBias = _lowerBias.exists(inputIndex) ? _lowerBias[inputIndex] : torch::Tensor();
+    torch::Tensor uBias = _upperBias.exists(inputIndex) ? _upperBias[inputIndex] : torch::Tensor();
+
+    if (lA.defined() && lA.dim() >= 2) {
+        int nodeDim = inputLower.size(0);
+        int expectedNodeDim = lA.size(-1);
+        if (nodeDim != expectedNodeDim) {
+            log(Stringf("concretizeNode(%u) - Dim mismatch: input=%d, expected=%d; fallback to IBP", startIndex, nodeDim, expectedNodeDim));
+            if (_ibpBounds.exists(startIndex)) {
+                _concreteBounds[startIndex] = _ibpBounds[startIndex];
+                _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+            }
+            return;
+        }
+    }
+
+    torch::Tensor concreteLower, concreteUpper;
+    computeConcreteBounds(lA, uA, lBias, uBias, inputLower, inputUpper, concreteLower, concreteUpper);
+
+    if (concreteLower.defined() && concreteUpper.defined()) {
+        BoundedTensor<torch::Tensor> concreteBounds(concreteLower, concreteUpper);
+        _concreteBounds[startIndex] = concreteBounds;
+        _torchModel->setConcreteBounds(startIndex, concreteBounds);
+    } else {
+        if (_ibpBounds.exists(startIndex)) {
+            _concreteBounds[startIndex] = _ibpBounds[startIndex];
+            _torchModel->setConcreteBounds(startIndex, _ibpBounds[startIndex]);
+        }
+    }
+}
+
+void CROWNAnalysis::concretizeBounds()
+{
+    concretizeNode(getOutputIndex());
+}
+
+Vector<BoundedTensor<torch::Tensor>> CROWNAnalysis::getInputBoundsForNode(unsigned nodeIndex) {
+    Vector<BoundedTensor<torch::Tensor>> inputBounds;
+    
+    if (_torchModel->getDependenciesMap().exists(nodeIndex) && !_torchModel->getDependencies(nodeIndex).empty()) {
+        
+        for (unsigned i = 0; i < _torchModel->getDependencies(nodeIndex).size(); ++i) {
+            unsigned inputIndex = _torchModel->getDependencies(nodeIndex)[i];
+            
+            auto node = _nodes[inputIndex];
+            unsigned outputSize = node->getOutputSize();
+            torch::Tensor lower, upper;
+
+            if (node->getNodeType() == NodeType::INPUT) {
+                if (_torchModel->hasInputBounds()) {
+                    lower = _torchModel->getInputLowerBounds();
+                    upper = _torchModel->getInputUpperBounds();
+                } else {
+                    lower = torch::zeros({(long)outputSize}, torch::kFloat32);
+                    upper = torch::ones({(long)outputSize}, torch::kFloat32);
+                }
+            } else {
+                // Prefer CROWN concrete bounds in standard mode; otherwise IBP
+                if (_useStandardCROWN && _concreteBounds.exists(inputIndex)) {
+                    lower = _concreteBounds[inputIndex].lower();
+                    upper = _concreteBounds[inputIndex].upper();
+                } else if (_ibpBounds.exists(inputIndex)) {
+                    lower = _ibpBounds[inputIndex].lower();
+                    upper = _ibpBounds[inputIndex].upper();
+                } else {
+                    lower = torch::zeros({(long)outputSize}, torch::kFloat32);
+                    upper = torch::ones({(long)outputSize}, torch::kFloat32);
+                }
+            }
+            inputBounds.append(BoundedTensor<torch::Tensor>(lower, upper));
+        }
+    } else {
+        log(Stringf("getInputBoundsForNode() - Node %u has no dependencies", nodeIndex));
+    }
+    log(Stringf("getInputBoundsForNode() - Completed for node %u with %u input bounds", nodeIndex, inputBounds.size()));
+    return inputBounds;
+}
+
+
+
+IN RELU NODE (TO TAKE ADVANTAGE OF PREIOUSLY COMPUTED RELAXATIONS)
+
+void BoundedReLUNode::boundBackward(
+    const torch::Tensor& last_lA, 
+    const torch::Tensor& last_uA,
+    const Vector<BoundedTensor<torch::Tensor>>& inputBounds,
+    Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
+    torch::Tensor& lbias,
+    torch::Tensor& ubias) {
+
+    if (inputBounds.size() < 1) throw std::runtime_error("BoundedReLUNode expects at least one input");
+    const auto& inputBound = inputBounds[0];
+    torch::Tensor input_lower = inputBound.lower();
+    torch::Tensor input_upper = inputBound.upper();
+
+    // Check cache validity (shape and approximate equality)
+    bool use_cache = _has_cached_relax
+        && _cached_in_lower.defined() && _cached_in_upper.defined()
+        && _cached_in_lower.sizes() == input_lower.sizes()
+        && _cached_in_upper.sizes() == input_upper.sizes()
+        && torch::allclose(_cached_in_lower, input_lower, /*rtol*/1e-5, /*atol*/1e-7)
+        && torch::allclose(_cached_in_upper, input_upper, /*rtol*/1e-5, /*atol*/1e-7);
+
+    torch::Tensor d_lower, d_upper, bias_lower, bias_upper;
+    if (use_cache) {
+        d_lower = _cached_d_lower;
+        d_upper = _cached_d_upper;
+        bias_lower = _cached_b_lower;
+        bias_upper = _cached_b_upper;
+    } else {
+        std::tie(d_lower, d_upper, bias_lower, bias_upper) = _backwardRelaxation(input_lower, input_upper);
+        // Update cache
+        _cached_d_lower = d_lower;
+        _cached_d_upper = d_upper;
+        _cached_b_lower = bias_lower;
+        _cached_b_upper = bias_upper;
+        _cached_in_lower = input_lower;
+        _cached_in_upper = input_upper;
+        _has_cached_relax = true;
+    }
+
+    // Extract slopes (already flat here)
+    torch::Tensor aL = d_lower;
+    torch::Tensor aU = d_upper;
+    torch::Tensor bL = bias_lower;
+    torch::Tensor bU = bias_upper;
+
+    auto expand_like = [](const torch::Tensor &v, const torch::Tensor &A) {
+        return v.unsqueeze(0).expand_as(A);
+    };
+
+    torch::Tensor new_lA, new_uA;
+    if (last_lA.defined()) {
+        auto Apos = torch::clamp_min(last_lA, 0);
+        auto Aneg = torch::clamp_max(last_lA, 0);
+        new_lA = Apos * expand_like(aL, last_lA) + Aneg * expand_like(aU, last_lA);
+        lbias = (Apos * expand_like(bL, last_lA) + Aneg * expand_like(bU, last_lA)).sum(-1);
+    }
+    if (last_uA.defined()) {
+        auto Apos = torch::clamp_min(last_uA, 0);
+        auto Aneg = torch::clamp_max(last_uA, 0);
+        new_uA = Apos * expand_like(aU, last_uA) + Aneg * expand_like(aL, last_uA);
+        ubias = (Apos * expand_like(bU, last_uA) + Aneg * expand_like(bL, last_uA)).sum(-1);
+    }
+
+    outputA_matrices.clear();
+    outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(new_lA, new_uA));
+}

@@ -47,7 +47,6 @@ torch::Tensor BoundedLinearNode::forward(const torch::Tensor& input) {
     return result;
 }
 
-// Auto-LiRPA style boundBackward method
 void BoundedLinearNode::boundBackward(
     const torch::Tensor& last_lA, 
     const torch::Tensor& last_uA,
@@ -55,24 +54,6 @@ void BoundedLinearNode::boundBackward(
     Vector<Pair<torch::Tensor, torch::Tensor>>& outputA_matrices,
     torch::Tensor& lbias,
     torch::Tensor& ubias) {
-    
-    // Debug prints for input A matrices and bias
-    std::cout << "\n=== BoundedLinearNode::boundBackward Debug ===" << std::endl;
-    std::cout << "[LINEAR INPUT] Node: " << _nodeName << " (index " << _nodeIndex << ")" << std::endl;
-    
-    if (last_lA.defined()) {
-        std::cout << "[LINEAR INPUT] last_lA shape: " << last_lA.sizes() << std::endl;
-        std::cout << "[LINEAR INPUT] last_lA:\n" << last_lA << std::endl;
-    } else {
-        std::cout << "[LINEAR INPUT] last_lA: undefined" << std::endl;
-    }
-    
-    if (last_uA.defined()) {
-        std::cout << "[LINEAR INPUT] last_uA shape: " << last_uA.sizes() << std::endl;
-        std::cout << "[LINEAR INPUT] last_uA:\n" << last_uA << std::endl;
-    } else {
-        std::cout << "[LINEAR INPUT] last_uA: undefined" << std::endl;
-    }
     
     if (inputBounds.size() < 1) {
         throw std::runtime_error("BoundedLinearNode expects at least one input");
@@ -82,82 +63,23 @@ void BoundedLinearNode::boundBackward(
     auto weight = _linearModule->weight.to(torch::kFloat32);
     auto bias = _linearModule->bias.defined() ? _linearModule->bias.to(torch::kFloat32) : torch::Tensor();
     
-    // Debug print original weight and bias
-    std::cout << "[LINEAR WEIGHTS] Original weight shape: " << weight.sizes() << std::endl;
-    std::cout << "[LINEAR WEIGHTS] Original weight:\n" << weight << std::endl;
-    
-    if (bias.defined()) {
-        std::cout << "[LINEAR WEIGHTS] Original bias shape: " << bias.sizes() << std::endl;
-        std::cout << "[LINEAR WEIGHTS] Original bias: " << bias << std::endl;
-    } else {
-        std::cout << "[LINEAR WEIGHTS] Original bias: undefined" << std::endl;
-    }
-    
-    std::cout << "[LINEAR WEIGHTS] Alpha scaling factor: " << _alpha << std::endl;
-    
     // Scale weight by alpha
     weight = _alpha * weight;
-    
-    // Debug print scaled weight
-    std::cout << "[LINEAR WEIGHTS] Scaled weight shape: " << weight.sizes() << std::endl;
-    std::cout << "[LINEAR WEIGHTS] Scaled weight:\n" << weight << std::endl;
     
     // For linear layers, A matrices are computed as: A = last_A @ weight
     // where last_A represents the transformation from final output to current layer input
     // and weight represents the transformation from current layer input to current layer output
     
-    // Debug output for A matrix operations
-    std::string last_lA_shape = "[";
-    for (int i = 0; i < last_lA.dim(); i++) {
-        if (i > 0) last_lA_shape += ", ";
-        last_lA_shape += std::to_string(last_lA.size(i));
-    }
-    last_lA_shape += "]";
-    
-    std::string weight_shape = "[";
-    for (int i = 0; i < weight.dim(); i++) {
-        if (i > 0) weight_shape += ", ";
-        weight_shape += std::to_string(weight.size(i));
-    }
-    weight_shape += "]";
-    
-    std::cout << "BoundedLinearNode::boundBackward: last_lA shape: " << last_lA_shape 
-              << ", weight shape: " << weight_shape << std::endl;
-    
     // Compute A matrices for linear layer
     torch::Tensor lA = torch::matmul(last_lA, weight);
     torch::Tensor uA = torch::matmul(last_uA, weight);
     
-    // Debug output for computed A matrices
-    std::string lA_shape = "[";
-    for (int i = 0; i < lA.dim(); i++) {
-        if (i > 0) lA_shape += ", ";
-        lA_shape += std::to_string(lA.size(i));
-    }
-    lA_shape += "]";
-    
-    std::string uA_shape = "[";
-    for (int i = 0; i < uA.dim(); i++) {
-        if (i > 0) uA_shape += ", ";
-        uA_shape += std::to_string(uA.size(i));
-    }
-    uA_shape += "]";
-    
-    std::cout << "BoundedLinearNode::boundBackward: computed lA shape: " << lA_shape 
-              << ", uA shape: " << uA_shape << std::endl;
-    
     outputA_matrices.append(Pair<torch::Tensor, torch::Tensor>(lA, uA));
     
-    // Compute bias contribution following auto-LiRPA's approach
+    // Compute bias contribution 
     // The key insight: bias terms must be transformed to output space dimensions
-    // so they can be accumulated across different layers
     if (bias.defined()) {
         if (last_lA.defined() && last_lA.numel() > 0) {
-            // Auto-LiRPA approach: bias gets transformed by the A matrix to output dimensions
-            // last_lA shape: [batch, final_output_size, current_layer_output_size] 
-            // bias shape: [current_layer_output_size]
-            // Result should have shape: [batch, final_output_size] (final output dimensions)
-            
             // Transform bias using A matrix multiplication
             // For our case: last_lA: [1, final_output_size, current_layer_output_size]
             // bias: [current_layer_output_size]
@@ -173,11 +95,6 @@ void BoundedLinearNode::boundBackward(
             torch::Tensor transformed_lbias = torch::matmul(last_lA, bias_reshaped).squeeze(-1).squeeze(0); // [final_output_size]
             torch::Tensor transformed_ubias = torch::matmul(last_uA, bias_reshaped).squeeze(-1).squeeze(0); // [final_output_size]
             
-            // Debug output
-            std::cout << "BoundedLinearNode::boundBackward: bias shape: [" << bias.size(0) << "]" << std::endl;
-            std::cout << "BoundedLinearNode::boundBackward: bias_reshaped shape: [" << bias_reshaped.size(0) << ", " << bias_reshaped.size(1) << ", " << bias_reshaped.size(2) << "]" << std::endl;
-            std::cout << "BoundedLinearNode::boundBackward: transformed_lbias shape: [" << transformed_lbias.size(0) << "]" << std::endl;
-            
             lbias = transformed_lbias;
             ubias = transformed_ubias;
         } else {
@@ -186,48 +103,8 @@ void BoundedLinearNode::boundBackward(
             ubias = torch::Tensor();
         }
     }
-    
-    // Debug prints for computed output A matrices and bias
-    std::cout << "[LINEAR OUTPUT] Computed A matrices:" << std::endl;
-    if (outputA_matrices.size() > 0) {
-        auto& outputPair = outputA_matrices[0];
-        torch::Tensor out_lA = outputPair.first();
-        torch::Tensor out_uA = outputPair.second();
-        
-        if (out_lA.defined()) {
-            std::cout << "[LINEAR OUTPUT] lA shape: " << out_lA.sizes() << std::endl;
-            std::cout << "[LINEAR OUTPUT] lA:\n" << out_lA << std::endl;
-        } else {
-            std::cout << "[LINEAR OUTPUT] lA: undefined" << std::endl;
-        }
-        
-        if (out_uA.defined()) {
-            std::cout << "[LINEAR OUTPUT] uA shape: " << out_uA.sizes() << std::endl;
-            std::cout << "[LINEAR OUTPUT] uA:\n" << out_uA << std::endl;
-        } else {
-            std::cout << "[LINEAR OUTPUT] uA: undefined" << std::endl;
-        }
-    }
-    
-    std::cout << "[LINEAR OUTPUT] Computed bias terms:" << std::endl;
-    if (lbias.defined()) {
-        std::cout << "[LINEAR OUTPUT] lbias shape: " << lbias.sizes() << std::endl;
-        std::cout << "[LINEAR OUTPUT] lbias: " << lbias << std::endl;
-    } else {
-        std::cout << "[LINEAR OUTPUT] lbias: undefined" << std::endl;
-    }
-    
-    if (ubias.defined()) {
-        std::cout << "[LINEAR OUTPUT] ubias shape: " << ubias.sizes() << std::endl;
-        std::cout << "[LINEAR OUTPUT] ubias: " << ubias << std::endl;
-    } else {
-        std::cout << "[LINEAR OUTPUT] ubias: undefined" << std::endl;
-    }
-    
-    std::cout << "=== End BoundedLinearNode::boundBackward Debug ===\n" << std::endl;
 }
 
-// Enhanced IBP with size setting fallback
 BoundedTensor<torch::Tensor> BoundedLinearNode::computeIntervalBoundPropagation(
     const Vector<BoundedTensor<torch::Tensor>>& inputBounds) {
     
@@ -242,8 +119,6 @@ BoundedTensor<torch::Tensor> BoundedLinearNode::computeIntervalBoundPropagation(
     // Set input size from input bounds if not already set
     if (_input_size == 0 && inputLowerBound.defined()) {
         setInputSize(inputLowerBound.numel());
-        std::cout << "[BoundedLinearNode::computeIntervalBoundPropagation] Set input size to " 
-                  << _input_size << " from input bounds" << std::endl;
     }
     
     // Extract weight and bias
@@ -267,8 +142,6 @@ BoundedTensor<torch::Tensor> BoundedLinearNode::computeIntervalBoundPropagation(
     // Set output size from computed bounds if not already set
     if (_output_size == 0 && lowerBound.defined()) {
         setOutputSize(lowerBound.numel());
-        std::cout << "[BoundedLinearNode::computeIntervalBoundPropagation] Set output size to " 
-                  << _output_size << " from computed bounds" << std::endl;
     }
     
     return BoundedTensor<torch::Tensor>(lowerBound, upperBound);
@@ -313,20 +186,14 @@ unsigned BoundedLinearNode::getOutputSize() const {
 void BoundedLinearNode::setInputSize(unsigned size) {
     if (size > 0) {
         _input_size = size;
-        std::cout << "[BoundedLinearNode::setInputSize] Set input size to " 
-                  << size << " for node " << _nodeName << std::endl;
     }
 }
 
 void BoundedLinearNode::setOutputSize(unsigned size) {
     if (size > 0) {
         _output_size = size;
-        std::cout << "[BoundedLinearNode::setOutputSize] Set output size to " 
-                  << size << " for node " << _nodeName << std::endl;
     }
 }
-
-
 
 // IBP computation methods
 torch::Tensor BoundedLinearNode::computeLinearIBPLowerBound(const torch::Tensor& inputLowerBound, const torch::Tensor& inputUpperBound) {

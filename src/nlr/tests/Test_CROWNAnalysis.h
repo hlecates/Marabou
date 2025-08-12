@@ -1,371 +1,395 @@
-
-#include "CROWNAnalysis.h"
-#include "TorchModel.h"
-#include "BoundedInputNode.h"
-#include "BoundedLinearNode.h"
-#include "BoundedReLUNode.h"
-#include "BoundedConstantNode.h"
-#include "FloatUtils.h"
-#include "InputQueryBuilder.h"
-#include "MStringf.h"
-
 #include <cxxtest/TestSuite.h>
+
+#include "../CROWNAnalysis.h"
+#include "../TorchModel.h"
+#include "../BoundedInputNode.h"
+#include "../BoundedLinearNode.h"
+#include "../BoundedReLUNode.h"
+#include "../../common/Vector.h"
+#include "../../common/Map.h"
+#include "../../input_parsers/InputQueryBuilder.h"
+
 #include <torch/torch.h>
+#include <memory>
+#include <cmath>
 
-class CROWNAnalysisTestSuite : public CxxTest::TestSuite
-{
+class CROWNAnalysisTestSuite : public CxxTest::TestSuite {
 public:
-    void setUp()
-    {
+    void setUp() {}
+    void tearDown() {}
+
+private:
+    // Helper: allclose for tensors
+    void assertAllClose(const torch::Tensor &a, const torch::Tensor &b, double atol = 1e-5, double rtol = 1e-5) {
+        TS_ASSERT(a.defined());
+        TS_ASSERT(b.defined());
+        TS_ASSERT_EQUALS(a.sizes(), b.sizes());
+        TS_ASSERT(torch::allclose(a, b, rtol, atol));
     }
 
-    void tearDown()
-    {
+    // Helper: build a minimal TorchModel with explicit nodes/deps
+    std::unique_ptr<NLR::TorchModel> buildModel(const Vector<std::shared_ptr<NLR::BoundedTorchNode>> &nodes,
+                                                const Map<unsigned, Vector<unsigned>> &deps,
+                                                const Vector<unsigned> &inputIndices,
+                                                unsigned outputIndex) {
+        Vector<Vector<Variable>> marabouVars;
+        Map<unsigned, Vector<Variable>> neuronToMarabouMap;
+        for (unsigned i = 0; i < nodes.size(); ++i) {
+            unsigned sz = nodes[i]->getOutputSize() > 0 ? nodes[i]->getOutputSize() : nodes[i]->getInputSize();
+            Vector<Variable> vars;
+            for (unsigned j = 0; j < (sz ? sz : 1); ++j) vars.append(Variable(i * 100 + j));
+            marabouVars.append(vars);
+            neuronToMarabouMap[i] = vars;
+        }
+        auto model = std::make_unique<NLR::TorchModel>(nodes, marabouVars, inputIndices, outputIndex, neuronToMarabouMap, deps);
+        return model;
     }
 
-    void testLinearLayerBoundBackward()
-    {
-        // Test parameters:
-        // Weight matrix: [[1,1],[0,1]]
-        // Bias: [1,0]
-        // Input bounds: [0,4] and [0,2]
-        // Expected: A matrices should equal weight matrix, bias should equal layer bias
-        
-        // Create weight matrix [[1,1],[0,1]]
-        torch::Tensor weight = torch::tensor({{1.0f, 1.0f}, {0.0f, 1.0f}}, torch::kFloat32);
-        
-        // Create bias [1,0]
-        torch::Tensor bias = torch::tensor({1.0f, 0.0f}, torch::kFloat32);
-        
-        // Create linear module
-        torch::nn::Linear linearModule(2, 2);
-        linearModule->weight = weight;
-        linearModule->bias = bias;
-        
-        // Create bounded linear node
-        std::shared_ptr<NLR::BoundedLinearNode> linearNode = 
-            std::make_shared<NLR::BoundedLinearNode>(linearModule, 1.0f, "test_linear");
-        
-        // Set node properties
-        linearNode->setNodeIndex(1);
-        linearNode->setInputSize(2);
-        linearNode->setOutputSize(2);
-        
-        // Create input bounds: [0,4] and [0,2]
-        torch::Tensor inputLower = torch::tensor({0.0f, 0.0f}, torch::kFloat32);
-        torch::Tensor inputUpper = torch::tensor({4.0f, 2.0f}, torch::kFloat32);
-        BoundedTensor<torch::Tensor> inputBounds(inputLower, inputUpper);
-        
-        // Create input bounds vector
-        Vector<BoundedTensor<torch::Tensor>> inputBoundsVector;
-        inputBoundsVector.append(inputBounds);
-        
-        // Create identity A matrices (2x2 identity for 2 outputs)
-        torch::Tensor identityA = torch::eye(2, torch::kFloat32).unsqueeze(0); // Shape [1, 2, 2]
-        
-        // Output containers
-        Vector<Pair<torch::Tensor, torch::Tensor>> outputA_matrices;
+public:
+    // ReLU backward: always active (lb >= 0)
+    void test_relu_backward_always_active() {
+        torch::nn::ReLU reluOptions{};
+        auto reluNode = std::make_shared<NLR::BoundedReLUNode>(reluOptions, "relu");
+        reluNode->setInputSize(3);
+        reluNode->setOutputSize(3);
+
+        torch::Tensor lb = torch::tensor({0.1f, 2.0f, 5.0f});
+        torch::Tensor ub = torch::tensor({1.0f, 3.0f, 6.0f});
+        Vector<BoundedTensor<torch::Tensor>> inBounds;
+        inBounds.append(BoundedTensor<torch::Tensor>(lb, ub));
+
+        torch::Tensor last_lA = torch::tensor({{1.0f, -2.0f, 0.5f}}); // (1,3)
+        torch::Tensor last_uA = torch::tensor({{-1.0f, 4.0f, -0.5f}});
+        Vector<Pair<torch::Tensor, torch::Tensor>> outA;
         torch::Tensor lbias, ubias;
-        
-        // Call boundBackward method
-        linearNode->boundBackward(identityA, identityA, inputBoundsVector, outputA_matrices, lbias, ubias);
-        
-        // Verify results
-        TS_ASSERT_EQUALS(outputA_matrices.size(), (unsigned)1);
-        
-        // Get the computed A matrices
-        torch::Tensor computed_lA = outputA_matrices[0].first();
-        torch::Tensor computed_uA = outputA_matrices[0].second();
-        
-        // Expected A matrices should equal the weight matrix
-        torch::Tensor expectedA = weight; // [[1,1],[0,1]]
-        
-        // Debug output
-        std::cout << "Test Linear Layer:" << std::endl;
-        std::cout << "Weight matrix: " << weight << std::endl;
-        std::cout << "Bias: " << bias << std::endl;
-        std::cout << "Input bounds - Lower: " << inputLower << ", Upper: " << inputUpper << std::endl;
-        std::cout << "Identity A matrix: " << identityA << std::endl;
-        std::cout << "Computed lA: " << computed_lA << std::endl;
-        std::cout << "Computed uA: " << computed_uA << std::endl;
-        std::cout << "Expected A: " << expectedA << std::endl;
-        std::cout << "Computed lbias: " << lbias << std::endl;
-        std::cout << "Computed ubias: " << ubias << std::endl;
-        std::cout << "Expected bias: " << bias << std::endl;
-        
-        // Check A matrix shapes
-        TS_ASSERT_EQUALS(computed_lA.dim(), 3); // Should be [batch, spec, input_dim]
-        TS_ASSERT_EQUALS(computed_uA.dim(), 3);
-        TS_ASSERT_EQUALS(computed_lA.size(0), 1); // batch size
-        TS_ASSERT_EQUALS(computed_lA.size(1), 2); // spec size (output dimension)
-        TS_ASSERT_EQUALS(computed_lA.size(2), 2); // input dimension
-        
-        // Remove batch dimension for comparison
-        torch::Tensor lA_2d = computed_lA.squeeze(0); // Shape [2, 2]
-        torch::Tensor uA_2d = computed_uA.squeeze(0); // Shape [2, 2]
-        
-        // Check that A matrices equal the weight matrix
-        TS_ASSERT(torch::allclose(lA_2d, expectedA, 1e-6));
-        TS_ASSERT(torch::allclose(uA_2d, expectedA, 1e-6));
-        
-        // Check bias terms
+        reluNode->boundBackward(last_lA, last_uA, inBounds, outA, lbias, ubias);
+
+        TS_ASSERT_EQUALS(outA.size(), 1U);
+        auto new_lA = outA[0].first();
+        auto new_uA = outA[0].second();
+
+        assertAllClose(new_lA, last_lA);
+        assertAllClose(new_uA, last_uA);
         TS_ASSERT(lbias.defined());
         TS_ASSERT(ubias.defined());
-        TS_ASSERT_EQUALS(lbias.numel(), 2);
-        TS_ASSERT_EQUALS(ubias.numel(), 2);
-        
-        // Expected bias should be the layer bias transformed by the identity A matrix
-        // Since A is identity, bias should remain the same
-        torch::Tensor expectedBias = bias; // [1, 0]
-        
-        TS_ASSERT(torch::allclose(lbias, expectedBias, 1e-6));
-        TS_ASSERT(torch::allclose(ubias, expectedBias, 1e-6));
-        
-        std::cout << "Linear layer test PASSED!" << std::endl;
+        assertAllClose(lbias, torch::zeros({last_lA.size(0)}));
+        assertAllClose(ubias, torch::zeros({last_uA.size(0)}));
     }
 
-    void testLinearLayerIBP()
-    {
-        // Test IBP computation for the same linear layer
-        
-        // Create weight matrix [[1,1],[0,1]]
-        torch::Tensor weight = torch::tensor({{1.0f, 1.0f}, {0.0f, 1.0f}}, torch::kFloat32);
-        
-        // Create bias [1,0]
-        torch::Tensor bias = torch::tensor({1.0f, 0.0f}, torch::kFloat32);
-        
-        // Create linear module
-        torch::nn::Linear linearModule(2, 2);
-        linearModule->weight = weight;
-        linearModule->bias = bias;
-        
-        // Create bounded linear node
-        std::shared_ptr<NLR::BoundedLinearNode> linearNode = 
-            std::make_shared<NLR::BoundedLinearNode>(linearModule, 1.0f, "test_linear_ibp");
-        
-        // Set node properties
-        linearNode->setNodeIndex(1);
-        linearNode->setInputSize(2);
-        linearNode->setOutputSize(2);
-        
-        // Create input bounds: [0,4] and [0,2]
-        torch::Tensor inputLower = torch::tensor({0.0f, 0.0f}, torch::kFloat32);
-        torch::Tensor inputUpper = torch::tensor({4.0f, 2.0f}, torch::kFloat32);
-        BoundedTensor<torch::Tensor> inputBounds(inputLower, inputUpper);
-        
-        // Create input bounds vector
-        Vector<BoundedTensor<torch::Tensor>> inputBoundsVector;
-        inputBoundsVector.append(inputBounds);
-        
-        // Call IBP method
-        BoundedTensor<torch::Tensor> ibpResult = linearNode->computeIntervalBoundPropagation(inputBoundsVector);
-        
-        // Manual calculation for verification:
-        // y = W*x + b where W = [[1,1],[0,1]], b = [1,0]
-        // For input bounds [0,4] and [0,2]:
-        // y1 = 1*x1 + 1*x2 + 1 = x1 + x2 + 1
-        // y2 = 0*x1 + 1*x2 + 0 = x2
-        
-        // For IBP with positive weights:
-        // y1_lower = 1*0 + 1*0 + 1 = 1
-        // y1_upper = 1*4 + 1*2 + 1 = 7
-        // y2_lower = 0*0 + 1*0 + 0 = 0  
-        // y2_upper = 0*4 + 1*2 + 0 = 2
-        
-        torch::Tensor expectedLower = torch::tensor({1.0f, 0.0f}, torch::kFloat32);
-        torch::Tensor expectedUpper = torch::tensor({7.0f, 2.0f}, torch::kFloat32);
-        
-        // Debug output
-        std::cout << "IBP Test:" << std::endl;
-        std::cout << "Input bounds - Lower: " << inputLower << ", Upper: " << inputUpper << std::endl;
-        std::cout << "Computed IBP - Lower: " << ibpResult.lower() << ", Upper: " << ibpResult.upper() << std::endl;
-        std::cout << "Expected IBP - Lower: " << expectedLower << ", Upper: " << expectedUpper << std::endl;
-        
-        // Check IBP results
-        TS_ASSERT(torch::allclose(ibpResult.lower(), expectedLower, 1e-6));
-        TS_ASSERT(torch::allclose(ibpResult.upper(), expectedUpper, 1e-6));
-        
-        std::cout << "Linear layer IBP test PASSED!" << std::endl;
-    }
-
-    void testReLULayerBoundBackward()
-    {
-        // Test parameters based on auto-LiRPA computation:
-        // Input bounds: [0,4] and [-2,2]  
-        // Previous A matrix: [[1,1],[0,1]] (weight matrix from linear layer)
-        // Previous bias: [1,0] (will be handled by bias accumulation in full CROWN pass)
-        // Expected D_lower: [[1,0],[0,0]] (diagonal matrix)
-        // Expected D_upper: [[1,0],[0,0.5]] (diagonal matrix)
-        // Expected A_lower: [[1,0],[0,0]]
-        // Expected A_upper: [[1,0.5],[0,0.5]]
-        // Expected ReLU lower bias: [0,0] (ReLU lower bounds have no bias)
-        // Expected ReLU upper bias: [1,1] (from ReLU relaxation)
-        
-        // Create ReLU module
-        torch::nn::ReLU reluModule;
-        
-        // Create bounded ReLU node
-        std::shared_ptr<NLR::BoundedReLUNode> reluNode = 
-            std::make_shared<NLR::BoundedReLUNode>(reluModule, "test_relu");
-        
-        // Set node properties
-        reluNode->setNodeIndex(2);
+    // ReLU backward: always inactive (ub <= 0)
+    void test_relu_backward_always_inactive() {
+        torch::nn::ReLU reluOptions{};
+        auto reluNode = std::make_shared<NLR::BoundedReLUNode>(reluOptions, "relu");
         reluNode->setInputSize(2);
         reluNode->setOutputSize(2);
-        
-        // Create input bounds: [0,4] and [-2,2]
-        torch::Tensor inputLower = torch::tensor({0.0f, -2.0f}, torch::kFloat32);
-        torch::Tensor inputUpper = torch::tensor({4.0f, 2.0f}, torch::kFloat32);
-        BoundedTensor<torch::Tensor> inputBounds(inputLower, inputUpper);
-        
-        // Create input bounds vector
-        Vector<BoundedTensor<torch::Tensor>> inputBoundsVector;
-        inputBoundsVector.append(inputBounds);
-        
-        // Create previous A matrix: [[1,1],[0,1]] (weight matrix from linear layer)
-        torch::Tensor prevA = torch::tensor({{1.0f, 1.0f}, {0.0f, 1.0f}}, torch::kFloat32).unsqueeze(0); // Shape [1, 2, 2]
-        
-        // Create previous bias: [1,0]
-        torch::Tensor prevBias = torch::tensor({1.0f, 0.0f}, torch::kFloat32);
-        
-        // Output containers
-        Vector<Pair<torch::Tensor, torch::Tensor>> outputA_matrices;
+
+        torch::Tensor lb = torch::tensor({-3.0f, -1.0f});
+        torch::Tensor ub = torch::tensor({-0.1f, -0.5f});
+        Vector<BoundedTensor<torch::Tensor>> inBounds;
+        inBounds.append(BoundedTensor<torch::Tensor>(lb, ub));
+
+        torch::Tensor last_lA = torch::tensor({{2.0f, -1.0f}});
+        torch::Tensor last_uA = torch::tensor({{-3.0f, 0.5f}});
+        Vector<Pair<torch::Tensor, torch::Tensor>> outA;
         torch::Tensor lbias, ubias;
-        
-        // Call boundBackward method
-        reluNode->boundBackward(prevA, prevA, inputBoundsVector, outputA_matrices, lbias, ubias);
-        
-        // Verify results
-        TS_ASSERT_EQUALS(outputA_matrices.size(), (unsigned)1);
-        
-        // Get the computed A matrices
-        torch::Tensor computed_lA = outputA_matrices[0].first();
-        torch::Tensor computed_uA = outputA_matrices[0].second();
-        
-        // Expected A matrices based on the specifications
-        torch::Tensor expected_lA = torch::tensor({{1.0f, 0.0f}, {0.0f, 0.0f}}, torch::kFloat32);
-        torch::Tensor expected_uA = torch::tensor({{1.0f, 0.5f}, {0.0f, 0.5f}}, torch::kFloat32);
-        
-        // Expected bias terms (based on auto-LiRPA computation):
-        // ReLU only adds its relaxation bias, previous layer bias handled separately
-        torch::Tensor expected_lbias = torch::tensor({0.0f, 0.0f}, torch::kFloat32); // ReLU lower has no bias
-        torch::Tensor expected_ubias = torch::tensor({1.0f, 1.0f}, torch::kFloat32); // ReLU upper relaxation bias
-        
-        // Debug output
-        std::cout << "Test ReLU Layer:" << std::endl;
-        std::cout << "Input bounds - Lower: " << inputLower << ", Upper: " << inputUpper << std::endl;
-        std::cout << "Previous A matrix: " << prevA.squeeze(0) << std::endl;
-        std::cout << "Previous bias: " << prevBias << std::endl;
-        std::cout << "Computed lA: " << computed_lA.squeeze(0) << std::endl;
-        std::cout << "Computed uA: " << computed_uA.squeeze(0) << std::endl;
-        std::cout << "Expected lA: " << expected_lA << std::endl;
-        std::cout << "Expected uA: " << expected_uA << std::endl;
-        std::cout << "Computed lbias: " << lbias << std::endl;
-        std::cout << "Computed ubias: " << ubias << std::endl;
-        std::cout << "Expected lbias: " << expected_lbias << std::endl;
-        std::cout << "Expected ubias: " << expected_ubias << std::endl;
-        
-        // Check A matrix shapes
-        TS_ASSERT_EQUALS(computed_lA.dim(), 3); // Should be [batch, spec, input_dim]
-        TS_ASSERT_EQUALS(computed_uA.dim(), 3);
-        TS_ASSERT_EQUALS(computed_lA.size(0), 1); // batch size
-        TS_ASSERT_EQUALS(computed_lA.size(1), 2); // spec size (output dimension)
-        TS_ASSERT_EQUALS(computed_lA.size(2), 2); // input dimension
-        
-        // Remove batch dimension for comparison
-        torch::Tensor lA_2d = computed_lA.squeeze(0); // Shape [2, 2]
-        torch::Tensor uA_2d = computed_uA.squeeze(0); // Shape [2, 2]
-        
-        // Check that A matrices match expected values
-        TS_ASSERT(torch::allclose(lA_2d, expected_lA, 1e-6));
-        TS_ASSERT(torch::allclose(uA_2d, expected_uA, 1e-6));
-        
-        // Check bias terms
-        TS_ASSERT(lbias.defined());
-        TS_ASSERT(ubias.defined());
-        TS_ASSERT_EQUALS(lbias.numel(), 2);
-        TS_ASSERT_EQUALS(ubias.numel(), 2);
-        
-        // Check bias values
-        TS_ASSERT(torch::allclose(lbias, expected_lbias, 1e-6));
-        TS_ASSERT(torch::allclose(ubias, expected_ubias, 1e-6));
-        
-        // Test the _backwardRelaxation helper method directly
-        auto [d_lower, d_upper, bias_lower, bias_upper] = reluNode->_backwardRelaxation(inputLower, inputUpper);
-        
-        // Expected slope vectors from _backwardRelaxation (no diagonal construction)
-        torch::Tensor expected_d_lower = torch::tensor({1.0f, 0.0f}, torch::kFloat32);
-        torch::Tensor expected_d_upper = torch::tensor({1.0f, 0.5f}, torch::kFloat32);
-        
-        std::cout << "Direct _backwardRelaxation test:" << std::endl;
-        std::cout << "Computed d_lower: " << d_lower << std::endl;
-        std::cout << "Computed d_upper: " << d_upper << std::endl;
-        std::cout << "Expected d_lower: " << expected_d_lower << std::endl;
-        std::cout << "Expected d_upper: " << expected_d_upper << std::endl;
-        std::cout << "Computed bias_lower: " << bias_lower << std::endl;
-        std::cout << "Computed bias_upper: " << bias_upper << std::endl;
-        
-        // Check slope vectors
-        TS_ASSERT_EQUALS(d_lower.dim(), 1);
-        TS_ASSERT_EQUALS(d_upper.dim(), 1);
-        TS_ASSERT_EQUALS(d_lower.numel(), 2);
-        TS_ASSERT_EQUALS(d_upper.numel(), 2);
-        TS_ASSERT(torch::allclose(d_lower, expected_d_lower, 1e-6));
-        TS_ASSERT(torch::allclose(d_upper, expected_d_upper, 1e-6));
-        
-        std::cout << "ReLU layer test PASSED!" << std::endl;
+        reluNode->boundBackward(last_lA, last_uA, inBounds, outA, lbias, ubias);
+
+        TS_ASSERT_EQUALS(outA.size(), 1U);
+        auto new_lA = outA[0].first();
+        auto new_uA = outA[0].second();
+
+        assertAllClose(new_lA, torch::zeros_like(last_lA));
+        assertAllClose(new_uA, torch::zeros_like(last_uA));
+        assertAllClose(lbias, torch::zeros({last_lA.size(0)}));
+        assertAllClose(ubias, torch::zeros({last_uA.size(0)}));
     }
 
-    void testReLULayerIBP()
-    {
-        // Test IBP computation for the ReLU layer
-        
-        // Create ReLU module
-        torch::nn::ReLU reluModule;
-        
-        // Create bounded ReLU node
-        std::shared_ptr<NLR::BoundedReLUNode> reluNode = 
-            std::make_shared<NLR::BoundedReLUNode>(reluModule, "test_relu_ibp");
-        
-        // Set node properties
-        reluNode->setNodeIndex(2);
+    // ReLU backward: uncertain cases - one with upper_slope > 0.5 (lower slope=1), one with <= 0.5 (lower slope=0)
+    void test_relu_backward_uncertain_cases() {
+        torch::nn::ReLU reluOptions{};
+        auto reluNode = std::make_shared<NLR::BoundedReLUNode>(reluOptions, "relu");
         reluNode->setInputSize(2);
         reluNode->setOutputSize(2);
-        
-        // Create input bounds: [0,4] and [-2,2]
-        torch::Tensor inputLower = torch::tensor({0.0f, -2.0f}, torch::kFloat32);
-        torch::Tensor inputUpper = torch::tensor({4.0f, 2.0f}, torch::kFloat32);
-        BoundedTensor<torch::Tensor> inputBounds(inputLower, inputUpper);
-        
-        // Create input bounds vector
-        Vector<BoundedTensor<torch::Tensor>> inputBoundsVector;
-        inputBoundsVector.append(inputBounds);
-        
-        // Call IBP method
-        BoundedTensor<torch::Tensor> ibpResult = reluNode->computeIntervalBoundPropagation(inputBoundsVector);
-        
-        // Manual calculation for verification:
-        // ReLU: y = max(0, x)
-        // For input bounds [0,4] and [-2,2]:
-        // y1_lower = max(0, 0) = 0
-        // y1_upper = max(0, 4) = 4
-        // y2_lower = max(0, -2) = 0
-        // y2_upper = max(0, 2) = 2
-        
-        torch::Tensor expectedLower = torch::tensor({0.0f, 0.0f}, torch::kFloat32);
-        torch::Tensor expectedUpper = torch::tensor({4.0f, 2.0f}, torch::kFloat32);
-        
-        // Debug output
-        std::cout << "ReLU IBP Test:" << std::endl;
-        std::cout << "Input bounds - Lower: " << inputLower << ", Upper: " << inputUpper << std::endl;
-        std::cout << "Computed IBP - Lower: " << ibpResult.lower() << ", Upper: " << ibpResult.upper() << std::endl;
-        std::cout << "Expected IBP - Lower: " << expectedLower << ", Upper: " << expectedUpper << std::endl;
-        
-        // Check IBP results
-        TS_ASSERT(torch::allclose(ibpResult.lower(), expectedLower, 1e-6));
-        TS_ASSERT(torch::allclose(ibpResult.upper(), expectedUpper, 1e-6));
-        
-        std::cout << "ReLU layer IBP test PASSED!" << std::endl;
+
+        // lb=[-1,-0.6], ub=[2,0.4] => upper slopes [2/3, 0.4/1.0] = [0.6666, 0.4]
+        torch::Tensor lb = torch::tensor({-1.0f, -0.6f});
+        torch::Tensor ub = torch::tensor({ 2.0f,  0.4f});
+        Vector<BoundedTensor<torch::Tensor>> inBounds;
+        inBounds.append(BoundedTensor<torch::Tensor>(lb, ub));
+
+        // Mix of + and - entries to test Apos/Aneg selection
+        torch::Tensor last_lA = torch::tensor({{ 1.0f, -2.0f}}); // (1,2)
+        torch::Tensor last_uA = torch::tensor({{-1.5f,  3.0f}});
+
+        // Expected slopes and biases per node logic
+        float aU0 = 2.0f / (2.0f - (-1.0f)); // 2/3
+        float aU1 = 0.4f / (0.4f - (-0.6f)); // 0.4/1.0=0.4
+        float aL0 = 1.0f;                    // > 0.5
+        float aL1 = 0.0f;                    // <= 0.5
+        float bU0 = -aU0 * (-1.0f);          // -aU*lb
+        float bU1 = -aU1 * (-0.6f);
+        float bL0 = 0.0f, bL1 = 0.0f;
+
+        torch::Tensor aL = torch::tensor({aL0, aL1}).unsqueeze(0); // (1,2)
+        torch::Tensor aU = torch::tensor({aU0, aU1}).unsqueeze(0);
+        torch::Tensor bL = torch::tensor({bL0, bL1}).unsqueeze(0);
+        torch::Tensor bU = torch::tensor({bU0, bU1}).unsqueeze(0);
+
+        auto Apos_l = torch::clamp_min(last_lA, 0);
+        auto Aneg_l = torch::clamp_max(last_lA, 0);
+        auto Apos_u = torch::clamp_min(last_uA, 0);
+        auto Aneg_u = torch::clamp_max(last_uA, 0);
+
+        torch::Tensor expected_lA = Apos_l * aL + Aneg_l * aU;
+        torch::Tensor expected_uA = Apos_u * aU + Aneg_u * aL;
+        torch::Tensor expected_lbias = (Apos_l * bL + Aneg_l * bU).sum(-1);
+        torch::Tensor expected_ubias = (Apos_u * bU + Aneg_u * bL).sum(-1);
+
+        Vector<Pair<torch::Tensor, torch::Tensor>> outA;
+        torch::Tensor lbias, ubias;
+        reluNode->boundBackward(last_lA, last_uA, inBounds, outA, lbias, ubias);
+
+        TS_ASSERT_EQUALS(outA.size(), 1U);
+        assertAllClose(outA[0].first(), expected_lA);
+        assertAllClose(outA[0].second(), expected_uA);
+        assertAllClose(lbias, expected_lbias);
+        assertAllClose(ubias, expected_ubias);
     }
 
+    // Linear backward: A propagation and bias transformation (3D A for consistency with implementation)
+    void test_linear_backward_A_and_bias() {
+        // Linear layer: out=2, in=3
+        torch::nn::Linear lin(torch::nn::LinearOptions(3, 2));
+        lin->weight = torch::tensor({{2.0f, -1.0f, 0.0f}, {0.0f, 3.0f, 1.0f}});
+        lin->bias = torch::tensor({1.0f, -2.0f});
+        auto linNode = std::make_shared<NLR::BoundedLinearNode>(lin, 1.0f, "lin");
+        linNode->setInputSize(3);
+        linNode->setOutputSize(2);
+
+        // last A shape (spec=1, out=2) to match BoundedLinearNode expectation (2D ok)
+        torch::Tensor last_lA = torch::tensor({{ 1.0f, -2.0f}});
+        torch::Tensor last_uA = torch::tensor({{-1.0f,  4.0f}});
+
+        Vector<BoundedTensor<torch::Tensor>> inBounds; // provide dummy to satisfy interface
+        inBounds.append(BoundedTensor<torch::Tensor>(torch::zeros({3}), torch::ones({3})));
+        Vector<Pair<torch::Tensor, torch::Tensor>> outA;
+        torch::Tensor lbias, ubias;
+        linNode->boundBackward(last_lA, last_uA, inBounds, outA, lbias, ubias);
+
+        TS_ASSERT_EQUALS(outA.size(), 1U);
+        auto lA = outA[0].first();
+        auto uA = outA[0].second();
+
+        torch::Tensor expected_lA = torch::matmul(last_lA, lin->weight); // (1,3)
+        torch::Tensor expected_uA = torch::matmul(last_uA, lin->weight);
+        assertAllClose(lA, expected_lA);
+        assertAllClose(uA, expected_uA);
+
+        // Bias transformed to final output dims: (spec=1)
+        // For 2D last_A, bias contribution reduces to row-wise dot with bias
+        torch::Tensor expected_lbias = torch::matmul(last_lA, lin->bias.unsqueeze(-1)).squeeze(-1);
+        torch::Tensor expected_ubias = torch::matmul(last_uA, lin->bias.unsqueeze(-1)).squeeze(-1);
+        assertAllClose(lbias, expected_lbias);
+        assertAllClose(ubias, expected_ubias);
+    }
+
+    // Input node backward: passthrough A, no bias
+    void test_input_backward_passthrough() {
+        auto inNode = std::make_shared<NLR::BoundedInputNode>(0, 3, "input");
+        inNode->setNodeIndex(0);
+
+        torch::Tensor last_lA = torch::tensor({{1.0f, -2.0f, 0.5f}});
+        torch::Tensor last_uA = torch::tensor({{-1.0f, 4.0f, -0.5f}});
+        Vector<BoundedTensor<torch::Tensor>> inBounds; // unused
+        Vector<Pair<torch::Tensor, torch::Tensor>> outA;
+        torch::Tensor lbias, ubias;
+        inNode->boundBackward(last_lA, last_uA, inBounds, outA, lbias, ubias);
+
+        TS_ASSERT_EQUALS(outA.size(), 1U);
+        assertAllClose(outA[0].first(), last_lA);
+        assertAllClose(outA[0].second(), last_uA);
+        TS_ASSERT(!lbias.defined());
+        TS_ASSERT(!ubias.defined());
+    }
+
+    // IBP: input node returns preset bounds
+    void test_ibp_input_node() {
+        auto inNode = std::make_shared<NLR::BoundedInputNode>(0, 2, "input");
+        torch::Tensor lb = torch::tensor({-1.0f, 0.5f});
+        torch::Tensor ub = torch::tensor({ 2.0f, 1.5f});
+        inNode->setInputBounds(BoundedTensor<torch::Tensor>(lb, ub));
+
+        Vector<BoundedTensor<torch::Tensor>> inBounds; // unused
+        auto res = inNode->computeIntervalBoundPropagation(inBounds);
+        assertAllClose(res.lower(), lb);
+        assertAllClose(res.upper(), ub);
+    }
+
+    // IBP: linear node matches analytical bound rules
+    void test_ibp_linear_node() {
+        torch::nn::Linear lin(torch::nn::LinearOptions(3, 2));
+        lin->weight = torch::tensor({{ 2.0f, -1.0f, 0.5f}, {-3.0f, 4.0f, -2.0f}});
+        lin->bias = torch::tensor({1.0f, -2.0f});
+        auto linNode = std::make_shared<NLR::BoundedLinearNode>(lin, 1.0f, "lin");
+
+        torch::Tensor xL = torch::tensor({-1.0f, 0.0f, 2.0f});
+        torch::Tensor xU = torch::tensor({ 3.0f, 1.0f, 4.0f});
+        Vector<BoundedTensor<torch::Tensor>> inBounds;
+        inBounds.append(BoundedTensor<torch::Tensor>(xL, xU));
+
+        auto res = linNode->computeIntervalBoundPropagation(inBounds);
+
+        // Compute expected via pos/neg decomposition
+        auto W = lin->weight;
+        auto Wpos = torch::clamp_min(W, 0);
+        auto Wneg = torch::clamp_max(W, 0);
+        torch::Tensor expectedL = torch::matmul(xL, Wpos.t()) + torch::matmul(xU, Wneg.t()) + lin->bias;
+        torch::Tensor expectedU = torch::matmul(xU, Wpos.t()) + torch::matmul(xL, Wneg.t()) + lin->bias;
+        assertAllClose(res.lower(), expectedL);
+        assertAllClose(res.upper(), expectedU);
+    }
+
+    // IBP: ReLU clamp behavior
+    void test_ibp_relu_node() {
+        torch::nn::ReLU reluOptions{};
+        auto reluNode = std::make_shared<NLR::BoundedReLUNode>(reluOptions, "relu");
+
+        torch::Tensor xL = torch::tensor({-1.0f, 0.5f, -0.2f});
+        torch::Tensor xU = torch::tensor({ 3.0f, 1.0f,  0.1f});
+        Vector<BoundedTensor<torch::Tensor>> inBounds;
+        inBounds.append(BoundedTensor<torch::Tensor>(xL, xU));
+
+        auto res = reluNode->computeIntervalBoundPropagation(inBounds);
+        assertAllClose(res.lower(), torch::clamp_min(xL, 0));
+        assertAllClose(res.upper(), torch::clamp_min(xU, 0));
+    }
+
+    // CROWNAnalysis: computeConcreteLowerBound/UpperBound arithmetic
+    void test_compute_concrete_bounds_from_A_bias_and_input() {
+        // A (spec=1, n=3)
+        torch::Tensor lA = torch::tensor({{ 1.0f, -2.0f, 0.5f}});
+        torch::Tensor uA = torch::tensor({{-1.0f,  4.0f, -0.5f}});
+        torch::Tensor lBias = torch::tensor({0.3f});
+        torch::Tensor uBias = torch::tensor({-0.2f});
+        torch::Tensor xL = torch::tensor({-1.0f, 0.0f, 2.0f});
+        torch::Tensor xU = torch::tensor({ 3.0f, 1.0f, 4.0f});
+
+        // Build minimal model to satisfy constructor; not used in this test beyond instantiation
+        Vector<std::shared_ptr<NLR::BoundedTorchNode>> nodes;
+        auto inNode = std::make_shared<NLR::BoundedInputNode>(0, 3, "input");
+        inNode->setNodeIndex(0);
+        nodes.append(inNode);
+        Map<unsigned, Vector<unsigned>> deps;
+        Vector<unsigned> inputs; inputs.append(0);
+        auto model = buildModel(nodes, deps, inputs, 0);
+        NLR::CROWNAnalysis crown(model.get());
+
+        // Expected formulas
+        auto AposL = torch::clamp_min(lA.unsqueeze(0), 0); // (1,1,3)
+        auto AnegL = torch::clamp_max(lA.unsqueeze(0), 0);
+        auto AposU = torch::clamp_min(uA.unsqueeze(0), 0);
+        auto AnegU = torch::clamp_max(uA.unsqueeze(0), 0);
+        auto xL3 = xL.unsqueeze(0).unsqueeze(-1);
+        auto xU3 = xU.unsqueeze(0).unsqueeze(-1);
+        auto lB3 = lBias.unsqueeze(0).unsqueeze(-1);
+        auto uB3 = uBias.unsqueeze(0).unsqueeze(-1);
+
+        torch::Tensor expectedLower = (AposL.bmm(xL3) + AnegL.bmm(xU3) + lB3).squeeze(-1).squeeze(0);
+        torch::Tensor expectedUpper = (AposU.bmm(xU3) + AnegU.bmm(xL3) + uB3).squeeze(-1).squeeze(0);
+
+        auto gotLower = crown.computeConcreteLowerBound(lA, lBias, xL, xU);
+        auto gotUpper = crown.computeConcreteUpperBound(uA, uBias, xL, xU);
+        assertAllClose(gotLower, expectedLower);
+        assertAllClose(gotUpper, expectedUpper);
+    }
+
+    // CROWNAnalysis helpers: preprocessC and addA/addBound/addBias
+    void test_helpers_additions_and_concretize_with_bias() {
+        // Build minimal model and analysis (single input node as output)
+        Vector<std::shared_ptr<NLR::BoundedTorchNode>> nodes;
+        auto inNode = std::make_shared<NLR::BoundedInputNode>(0, 2, "input");
+        inNode->setNodeIndex(0);
+        nodes.append(inNode);
+        Map<unsigned, Vector<unsigned>> deps;
+        Vector<unsigned> inputs; inputs.append(0);
+        auto model = buildModel(nodes, deps, inputs, 0);
+        NLR::CROWNAnalysis crown(model.get());
+
+        // addA utility
+        torch::Tensor A1 = torch::tensor({{1.0f, 2.0f}}); // (1,2)
+        torch::Tensor A2 = torch::tensor({{3.0f, 4.0f}});
+        auto sum = crown.addA(A1, A2);
+        assertAllClose(sum, torch::tensor({{4.0f, 6.0f}}));
+
+        // Prepare final A and bias at the input index and set input bounds
+        torch::Tensor final_lA = torch::tensor({{ 1.0f, -2.0f}});
+        torch::Tensor final_uA = torch::tensor({{-1.0f,  4.0f}});
+        torch::Tensor lBias = torch::tensor({0.3f, -0.1f}); // spec=2
+        torch::Tensor uBias = torch::tensor({-0.2f, 0.5f});
+        crown.addBound(0, final_lA, final_uA);
+        crown.addBias(0, lBias, uBias);
+
+        torch::Tensor xL = torch::tensor({-1.0f, 0.0f});
+        torch::Tensor xU = torch::tensor({ 3.0f, 1.0f});
+        model->setInputBounds(BoundedTensor<torch::Tensor>(xL, xU));
+
+        // Concretize and check output bounds
+        crown.concretizeBounds();
+        auto out = crown.getOutputBounds();
+        auto lA3 = final_lA.unsqueeze(0); // (1,2,2) after ensure3A inside
+        auto uA3 = final_uA.unsqueeze(0);
+        auto xL3 = xL.unsqueeze(0).unsqueeze(-1);
+        auto xU3 = xU.unsqueeze(0).unsqueeze(-1);
+        auto lB3 = lBias.unsqueeze(0).unsqueeze(-1);
+        auto uB3 = uBias.unsqueeze(0).unsqueeze(-1);
+        torch::Tensor expectedLower = (torch::clamp_min(lA3, 0).bmm(xL3) + torch::clamp_max(lA3, 0).bmm(xU3) + lB3).squeeze(-1).squeeze(0);
+        torch::Tensor expectedUpper = (torch::clamp_min(uA3, 0).bmm(xU3) + torch::clamp_max(uA3, 0).bmm(xL3) + uB3).squeeze(-1).squeeze(0);
+        assertAllClose(out.lower(), expectedLower);
+        assertAllClose(out.upper(), expectedUpper);
+    }
+
+    // IBP propagation end-to-end on a tiny graph: Input(2) -> Linear(2)
+    void test_ibp_end_to_end_small_graph() {
+        // Nodes
+        auto input = std::make_shared<NLR::BoundedInputNode>(0, 2, "input");
+        input->setNodeIndex(0);
+        torch::nn::Linear lin(torch::nn::LinearOptions(2, 2));
+        lin->weight = torch::tensor({{1.0f, -1.0f}, {0.5f, 2.0f}});
+        lin->bias = torch::tensor({0.5f, -1.0f});
+        auto linNode = std::make_shared<NLR::BoundedLinearNode>(lin, 1.0f, "lin");
+        linNode->setNodeIndex(1);
+        linNode->setInputSize(2);
+        linNode->setOutputSize(2);
+
+        Vector<std::shared_ptr<NLR::BoundedTorchNode>> nodes;
+        nodes.append(input);
+        nodes.append(linNode);
+
+        // Dependencies: lin depends on input
+        Map<unsigned, Vector<unsigned>> deps;
+        deps[0] = Vector<unsigned>();
+        Vector<unsigned> d; d.append(0); deps[1] = d;
+
+        Vector<unsigned> inputs; inputs.append(0);
+        auto model = buildModel(nodes, deps, inputs, 1);
+
+        // Set input bounds on the model
+        torch::Tensor xL = torch::tensor({-1.0f, 2.0f});
+        torch::Tensor xU = torch::tensor({ 3.0f, 5.0f});
+        model->setInputBounds(BoundedTensor<torch::Tensor>(xL, xU));
+
+        NLR::CROWNAnalysis crown(model.get());
+        crown.computeIBPBounds();
+
+        // IBP for linear
+        auto W = lin->weight;
+        auto Wpos = torch::clamp_min(W, 0);
+        auto Wneg = torch::clamp_max(W, 0);
+        torch::Tensor expectedL = torch::matmul(xL, Wpos.t()) + torch::matmul(xU, Wneg.t()) + lin->bias;
+        torch::Tensor expectedU = torch::matmul(xU, Wpos.t()) + torch::matmul(xL, Wneg.t()) + lin->bias;
+
+        auto linBounds = crown.getNodeIBPBounds(1);
+        assertAllClose(linBounds.lower(), expectedL);
+        assertAllClose(linBounds.upper(), expectedU);
+    }
 };
